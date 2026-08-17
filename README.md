@@ -11,7 +11,7 @@ DeepSeek Harness（DSH）标准 bundle 插件：显示 **DeepSeek 账户余额**
 
 ### 主页摘要条（输入框下方）
 
-摘要条静息状态（无调用时显示会话最近使用/选中的模型）：
+摘要条静息状态（显示会话最近使用的模型，费用记录从安装插件/重置记录起计算，无法加载历史记录）：
 
 ![摘要条·静息](assets/screenshot-summary-idle.png)
 
@@ -29,11 +29,11 @@ DeepSeek Harness（DSH）标准 bundle 插件：显示 **DeepSeek 账户余额**
 
 ### 插件中心「DeepSeek 用量」面板（设置 → 插件）
 
-静息状态（余额与统计加载中）：
+静息状态（安装/重置后尚未使用，无明细）：
 
 ![设置页·静息](assets/screenshot-settings-idle.png)
 
-使用示例（余额明细、按模型明细、各会话消耗、导出/重置按钮）：
+使用示例（展示余额明细、按模型明细、各会话消耗明细，支持导出为CSV文件）：
 
 ![设置页·使用示例](assets/screenshot-settings-used.png)
 
