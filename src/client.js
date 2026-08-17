@@ -13,6 +13,14 @@ if (typeof window !== 'undefined' && typeof window.__ModuleLoader__ !== 'undefin
     id: 'dsh-balance-and-cost',
     factory(require) {
       const React = require('react')
+      // 复用 DSH 的 Tooltip（与默认 stats 行同款）；该内部包不在 boot graph 时优雅回退
+      let Tooltip = null
+      try {
+        const primitives = require('@deepseek-ai/dsh-client-ui-primitives')
+        if (primitives && primitives.Tooltip) Tooltip = primitives.Tooltip
+      } catch {
+        Tooltip = null
+      }
       const API_BALANCE = '/__dsh-balance-and-cost/balance'
       const API_USAGE = '/__dsh-balance-and-cost/usage'
       const REFRESH_MS = 15000
@@ -50,6 +58,7 @@ if (typeof window !== 'undefined' && typeof window.__ModuleLoader__ !== 'undefin
             .dsbal-sum { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 10px; font-size: 12px; color: var(--dsw-alias-label-secondary); line-height: 1.6; }
             .dsbal-sum b { color: var(--dsw-alias-label-primary); font-weight: 600; font-variant-numeric: tabular-nums; }
             .dsbal-sep { opacity: 0.45; }
+            .dsbal-models { cursor: help; border-bottom: 1px dotted var(--dsw-alias-border-l2); }
           `
           document.head.appendChild(styleEl)
           ctx.on('dispose', () => {
@@ -208,7 +217,7 @@ if (typeof window !== 'undefined' && typeof window.__ModuleLoader__ !== 'undefin
               ? fmtBal(balance.totalBalance) + ' ' + balance.currency
               : (balance && !balance.ok ? '余额—' : '余额…')
 
-            let curText = '本会话 —'
+            let curNodes = React.createElement('span', null, '本会话 —')
             let totText = '总计 —'
             if (usage) {
               const curModels = modelsOf(usage.current)
@@ -218,14 +227,27 @@ if (typeof window !== 'undefined' && typeof window.__ModuleLoader__ !== 'undefin
               } else if (usage.selectedModel && usage.selectedModel.model) {
                 curLabel = usage.selectedModel.model
               }
-              curText = '本会话' + (curLabel ? ' (' + curLabel + ')' : '') + ' ' + fmtNum(tokOf(usage.current)) + ' tok ≈' + fmtCostShort(usage.current.costCny)
               totText = '总计 ' + fmtNum(tokOf(usage.totals)) + ' tok ≈' + fmtCostShort(usage.totals.costCny)
+              const tokText = fmtNum(tokOf(usage.current)) + ' tok ≈' + fmtCostShort(usage.current.costCny)
+              if (curLabel) {
+                let labelEl = React.createElement('span', { className: 'dsbal-models' }, curLabel)
+                // 多模型混用时悬停展开明细（与默认 stats 行同款 Tooltip）
+                if (curModels && curModels.length > 1 && Tooltip !== null) {
+                  const detail = (usage.current.modelsDetail || [])
+                    .map((m) => m.model + ' ×' + m.calls)
+                    .join(' · ')
+                  if (detail) labelEl = React.createElement(Tooltip, { label: detail, side: 'top', delayMs: 500 }, labelEl)
+                }
+                curNodes = React.createElement('span', null, '本会话 (', labelEl, ') ', tokText)
+              } else {
+                curNodes = React.createElement('span', null, '本会话 ', tokText)
+              }
             }
 
             const nodes = [
               React.createElement('span', { key: 'b' }, React.createElement('b', null, 'DeepSeek'), ' 余额 ', React.createElement('b', null, balText)),
               React.createElement('span', { key: 'sep1', className: 'dsbal-sep' }, '·'),
-              React.createElement('span', { key: 'c' }, curText),
+              React.createElement('span', { key: 'c' }, curNodes),
               React.createElement('span', { key: 'sep2', className: 'dsbal-sep' }, '·'),
               React.createElement('span', { key: 't' }, totText),
             ]

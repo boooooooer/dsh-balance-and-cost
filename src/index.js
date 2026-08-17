@@ -289,6 +289,12 @@ export function apply(ctx) {
     totals.anyEstimated = stats.totals.anyEstimated
     totals.perModel = perModel
     const current = rowView(currentRow)
+    // 当前会话模型明细（含调用次数，供摘要条悬停展开）
+    current.modelsDetail = currentRow.models
+      ? Object.keys(currentRow.models)
+        .map((m) => ({ model: m, calls: currentRow.models[m] }))
+        .sort((a, b) => b.calls - a.calls)
+      : []
     // 会话当前选中的模型（agentDefaultModel：用户切换模型即时生效；未产生调用时用于即时显示）
     let selectedModel = null
     const defaultModelService = ctx.get('agentDefaultModel')
