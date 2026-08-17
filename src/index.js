@@ -208,12 +208,15 @@ export function apply(ctx) {
             s.cacheWriteTokens += cw
             s.reasoningTokens += rt
             s.costCny += cost
-            s.models[model] = (s.models[model] || 0) + 1
+            // 模型名归一化到价格表 key（带版本后缀如 deepseek-v4-flash-0731 → deepseek-v4-flash），
+            // 保证 models/modelsTok 的 key 与价格表、悬停查询一致；未收录模型保留原始名
+            const normModel = resolvePriceTable(model) !== undefined ? Object.keys(PRICES).find((k) => model === k || model.startsWith(k + '-') || model.startsWith(k + '_')) : model
+            s.models[normModel] = (s.models[normModel] || 0) + 1
             // 按模型细分 token（供「当前模型实际消耗」与悬停两模型对比）
-            let mt = s.modelsTok[model]
+            let mt = s.modelsTok[normModel]
             if (!mt) {
               mt = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, costCny: 0 }
-              s.modelsTok[model] = mt
+              s.modelsTok[normModel] = mt
             }
             mt.inputTokens += i
             mt.outputTokens += o
@@ -312,7 +315,17 @@ export function apply(ctx) {
     // 当前会话按模型的实际消耗（实时累计值，供摘要条「本会话(当前选中模型)」与悬停两模型对比）。
     // 只统计真实调用过的模型——选中但未调用绝不进入列表。
     const modelTokens = (m) => {
-      const t = (currentRow.modelsTok && currentRow.modelsTok[m]) || null
+      const map = currentRow.modelsTok || {}
+      // 先精确查，miss 时前缀匹配（兼容历史数据里带版本后缀的 key，如 deepseek-v4-flash-0731）
+      let t = map[m] || null
+      if (!t) {
+        for (const k of Object.keys(map)) {
+          if (k.startsWith(m + '-') || k.startsWith(m + '_')) {
+            t = map[k]
+            break
+          }
+        }
+      }
       return t
         ? { tokens: (t.inputTokens || 0) + (t.outputTokens || 0) + (t.cacheReadTokens || 0) + (t.cacheWriteTokens || 0), costCny: t.costCny || 0 }
         : { tokens: 0, costCny: 0 }
