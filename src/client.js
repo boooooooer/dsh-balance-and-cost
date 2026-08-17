@@ -178,8 +178,48 @@ if (typeof window !== 'undefined' && typeof window.__ModuleLoader__ !== 'undefin
                 usageCard.push(React.createElement('div', { className: 'dsbal-title', key: 'st' }, '各会话消耗'))
                 usageCard.push(React.createElement('div', { className: 'dsbal-grid', key: 'sg' },
                   usage.sessions.map((s) => React.createElement('div', { key: s.sessionId },
-                    React.createElement('span', null, '会话 ' + String(s.sessionId).slice(0, 8) + (s.models && s.models.length === 1 ? ' · ' + s.models[0] : '')),
+                    React.createElement('span', null,
+                      (s.title || '会话 ' + String(s.sessionId).slice(0, 8))
+                      + (s.models && s.models.length === 1 ? ' · ' + s.models[0] : '')),
                     fmtNum(s.calls) + ' 次 · ' + fmtNum(s.inputTokens + s.outputTokens) + ' tok ≈' + fmtCostShort(s.costCny)))))
+              }
+            }
+
+            // 导出明细（CSV）：按模型 + 按会话
+            const exportCsv = () => {
+              if (!usage) return
+              const rows = []
+              rows.push(['类型', '名称', '调用次数', '输入·未命中', '输入·命中', '输出', '合计 tok', '估算费用(CNY)'])
+              const tot = usage.totals || {}
+              rows.push(['总计', '全部', tot.calls || 0, tot.inputTokens || 0, tot.cacheReadTokens || 0, tot.outputTokens || 0, (tot.inputTokens || 0) + (tot.cacheReadTokens || 0) + (tot.outputTokens || 0), (tot.costCny || 0).toFixed(6)])
+              for (const r of (tot.perModel || [])) {
+                rows.push(['模型', r.model, r.calls, r.inputTokens, r.cacheReadTokens, r.outputTokens, (r.inputTokens + r.cacheReadTokens + r.outputTokens), (r.costCny || 0).toFixed(6)])
+              }
+              for (const s of (usage.sessions || [])) {
+                rows.push(['会话', s.title || String(s.sessionId), s.calls, s.inputTokens, s.cacheReadTokens, s.outputTokens, (s.inputTokens + s.cacheReadTokens + s.outputTokens), (s.costCny || 0).toFixed(6)])
+              }
+              const csv = '\uFEFF' + rows.map((r) => r.map((v) => '"' + String(v).replace(/"/g, '""') + '"').join(',')).join('\r\n')
+              const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' })
+              const url = URL.createObjectURL(blob)
+              const a = document.createElement('a')
+              a.href = url
+              a.download = 'dsh-balance-and-cost-' + new Date().toISOString().slice(0, 10) + '.csv'
+              a.click()
+              URL.revokeObjectURL(url)
+            }
+            // 重置记录（Host 清空统计并持久化）
+            const resetStats = async () => {
+              if (typeof window !== 'undefined' && typeof window.confirm === 'function'
+                && !window.confirm('确定要清空全部用量统计与余额基线吗？此操作不可撤销。')) {
+                return
+              }
+              try {
+                const res = await fetch('/__dsh-balance-and-cost/reset', { method: 'POST' })
+                const body = await res.json()
+                if (!body || body.ok !== true) throw new Error((body && body.error) || 'reset failed')
+                load()
+              } catch (e) {
+                setError(String((e && e.message) || e))
               }
             }
 
@@ -189,6 +229,8 @@ if (typeof window !== 'undefined' && typeof window.__ModuleLoader__ !== 'undefin
                 React.createElement('div', { className: 'dsbal-card' }, usageCard)),
               React.createElement('div', { className: 'dsbal-foot' },
                 React.createElement('button', { className: 'dsbal-btn', onClick: load, disabled: busy }, busy ? '刷新中…' : '刷新'),
+                React.createElement('button', { className: 'dsbal-btn', onClick: exportCsv }, '导出明细'),
+                React.createElement('button', { className: 'dsbal-btn', onClick: resetStats }, '重置记录'),
                 error ? React.createElement('span', { className: 'dsbal-bad' }, '刷新出错：' + error) : null),
               React.createElement('div', { className: 'dsbal-note' }, '每 15 秒自动刷新（余额查询 Host 端缓存 60 秒）。费用按官方价格表（api-docs.deepseek.com/quick_start/pricing）分高峰/空闲时段计价，随调用时刻自动判定。'))
           }

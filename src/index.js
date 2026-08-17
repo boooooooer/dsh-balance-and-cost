@@ -340,17 +340,41 @@ export function apply(ctx) {
     }
   }
 
-  function usageSnapshot(sessionId) {
+  async function usageSnapshot(sessionId) {
     const sid = typeof sessionId === 'string' && sessionId ? sessionId : null
     const currentRow = sid && stats.sessions[sid] ? stats.sessions[sid] : emptySession()
     const perModel = Object.keys(stats.totals.perModel).map((key) => {
       const r = stats.totals.perModel[key]
       return { provider: r.provider, model: r.model, calls: r.calls, inputTokens: r.inputTokens, outputTokens: r.outputTokens, cacheReadTokens: r.cacheReadTokens, cacheWriteTokens: r.cacheWriteTokens, costCny: r.costCny, estimated: r.estimated }
     })
-    const sessions = Object.keys(stats.sessions).map((id) => {
+    // 会话标题（sessionQuery.readTitle，读取失败或未命名则回退 null）
+    const sessionQueryService = ctx.get('sessionQuery')
+    const titleOf = async (id) => {
+      if (!sessionQueryService || typeof sessionQueryService.readTitle !== 'function') return null
+      try {
+        const t = await sessionQueryService.readTitle(id)
+        return t && t.title ? String(t.title) : null
+      } catch {
+        return null
+      }
+    }
+    const sessions = []
+    for (const id of Object.keys(stats.sessions)) {
       const s = stats.sessions[id]
-      return { sessionId: id, calls: s.calls, inputTokens: s.inputTokens, outputTokens: s.outputTokens, cacheReadTokens: s.cacheReadTokens, cacheWriteTokens: s.cacheWriteTokens, reasoningTokens: s.reasoningTokens, costCny: s.costCny, models: Object.keys(s.models) }
-    }).sort((a, b) => (b.inputTokens + b.outputTokens) - (a.inputTokens + a.outputTokens))
+      sessions.push({
+        sessionId: id,
+        title: await titleOf(id),
+        calls: s.calls,
+        inputTokens: s.inputTokens,
+        outputTokens: s.outputTokens,
+        cacheReadTokens: s.cacheReadTokens,
+        cacheWriteTokens: s.cacheWriteTokens,
+        reasoningTokens: s.reasoningTokens,
+        costCny: s.costCny,
+        models: Object.keys(s.models),
+      })
+    }
+    sessions.sort((a, b) => (b.inputTokens + b.outputTokens) - (a.inputTokens + a.outputTokens))
     const totals = rowView(stats.totals)
     totals.anyEstimated = stats.totals.anyEstimated
     totals.perModel = perModel
@@ -463,7 +487,27 @@ export function apply(ctx) {
           return
         }
         const url = new URL(req.url || '/', 'http://localhost')
-        sendJson(res, usageSnapshot(url.searchParams.get('sessionId')))
+        usageSnapshot(url.searchParams.get('sessionId')).then((value) => sendJson(res, value)).catch((e) => {
+          sendJson(res, { ok: false, error: String((e && e.message) || e) })
+        })
+      },
+    }))
+    disposers.push(ctx.webServer.register({
+      kind: 'exact',
+      path: '/__dsh-balance-and-cost/reset',
+      handler: (req, res) => {
+        if (req.method !== 'POST') {
+          sendJson(res, { ok: false, error: 'method not allowed' }, 405)
+          return
+        }
+        stats.totals = emptyTotals()
+        stats.sessions = {}
+        stats.baseline = null
+        stats.startedAt = Date.now()
+        balanceCache = { at: 0, value: null }
+        saveStats(stats)
+        sseBroadcast({ type: 'usage' })
+        sendJson(res, { ok: true })
       },
     }))
     disposers.push(ctx.webServer.register({
