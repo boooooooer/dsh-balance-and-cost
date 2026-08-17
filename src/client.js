@@ -184,10 +184,10 @@ if (typeof window !== 'undefined' && typeof window.__ModuleLoader__ !== 'undefin
                 usageCard.push(React.createElement('div', { className: 'dsbal-sess-list', key: 'sg' },
                   usage.sessions.map((s) => React.createElement('div', { className: 'dsbal-sess', key: s.sessionId },
                     React.createElement('div', { className: 'dsbal-sess-title' }, s.title || '会话 ' + String(s.sessionId).slice(0, 8)),
-                    (s.modelsDetail || []).map((md) => React.createElement('div', { className: 'dsbal-sess-model', key: md.model },
-                      '- ' + md.model + '：' + fmtNum(md.calls) + ' 次 · ' + fmtCompact(md.tokens) + ' tok ≈' + fmtCostShort(md.costCny))),
                     React.createElement('div', { className: 'dsbal-sess-stats' },
-                      fmtNum(s.calls) + ' 次 · ' + fmtCompact((s.inputTokens || 0) + (s.cacheReadTokens || 0) + (s.cacheWriteTokens || 0) + (s.outputTokens || 0)) + ' tok ≈' + fmtCostShort(s.costCny))))))
+                      '总计 ' + fmtNum(s.calls) + ' 次 · ' + fmtCompact((s.inputTokens || 0) + (s.cacheReadTokens || 0) + (s.cacheWriteTokens || 0) + (s.outputTokens || 0)) + ' tok ≈' + fmtCostShort(s.costCny)),
+                    (s.modelsDetail || []).map((md) => React.createElement('div', { className: 'dsbal-sess-model', key: md.model },
+                      '- ' + md.model + '：' + fmtNum(md.calls) + ' 次 · ' + fmtCompact(md.tokens) + ' tok ≈' + fmtCostShort(md.costCny)))))))
               }
             }
 

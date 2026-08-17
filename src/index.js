@@ -361,23 +361,30 @@ export function apply(ctx) {
     const sessions = []
     for (const id of Object.keys(stats.sessions)) {
       const s = stats.sessions[id]
-      // 固定列出价格表内两个模型的明细；未调用过的模型给 0 占位
-      const modelsDetail = Object.keys(PRICES).map((m) => {
-        let t = (s.modelsTok && s.modelsTok[m]) || null
-        if (!t && s.modelsTok) {
-          for (const k of Object.keys(s.modelsTok)) {
-            if (k.startsWith(m + '-') || k.startsWith(m + '_')) {
-              t = s.modelsTok[k]
-              break
-            }
+      // 分模型明细：价格表内模型（flash/pro）+ 该会话实际用过的所有模型；
+      // 聚合精确与全部前缀 key（兼容历史 key 分裂）；未调用模型给 0 占位。
+      const sessionModelKeys = new Set([...Object.keys(PRICES), ...Object.keys(s.models), ...Object.keys(s.modelsTok || {})])
+      const modelsDetail = []
+      for (const m of sessionModelKeys) {
+        let calls = 0
+        let tokens = 0
+        let costCny = 0
+        for (const k of Object.keys(s.models)) {
+          if (k === m || k.startsWith(m + '-') || k.startsWith(m + '_')) calls += s.models[k] || 0
+        }
+        for (const k of Object.keys(s.modelsTok || {})) {
+          if (k === m || k.startsWith(m + '-') || k.startsWith(m + '_')) {
+            const t = s.modelsTok[k]
+            tokens += (t.inputTokens || 0) + (t.outputTokens || 0) + (t.cacheReadTokens || 0) + (t.cacheWriteTokens || 0)
+            costCny += t.costCny || 0
           }
         }
-        return {
-          model: m,
-          calls: s.models[m] || 0,
-          tokens: t ? (t.inputTokens || 0) + (t.outputTokens || 0) + (t.cacheReadTokens || 0) + (t.cacheWriteTokens || 0) : 0,
-          costCny: t ? t.costCny || 0 : 0,
-        }
+        modelsDetail.push({ model: m, calls, tokens, costCny })
+      }
+      modelsDetail.sort((a, b) => {
+        if (a.calls !== b.calls) return b.calls - a.calls
+        if (a.tokens !== b.tokens) return b.tokens - a.tokens
+        return a.model < b.model ? -1 : 1
       })
       sessions.push({
         sessionId: id,
@@ -423,22 +430,18 @@ export function apply(ctx) {
     }
     const current = rowView(currentRow)
     // 当前会话按模型的实际消耗（实时累计值，供摘要条「本会话(当前选中模型)」与悬停两模型对比）。
-    // 只统计真实调用过的模型——选中但未调用绝不进入列表。
+    // 聚合精确 key 与所有前缀 key（兼容历史 key 分裂：deepseek-v4-flash + deepseek-v4-flash-0731）。
     const modelTokens = (m) => {
-      const map = currentRow.modelsTok || {}
-      // 先精确查，miss 时前缀匹配（兼容历史数据里带版本后缀的 key，如 deepseek-v4-flash-0731）
-      let t = map[m] || null
-      if (!t) {
-        for (const k of Object.keys(map)) {
-          if (k.startsWith(m + '-') || k.startsWith(m + '_')) {
-            t = map[k]
-            break
-          }
+      let tokens = 0
+      let costCny = 0
+      for (const k of Object.keys(currentRow.modelsTok || {})) {
+        if (k === m || k.startsWith(m + '-') || k.startsWith(m + '_')) {
+          const t = currentRow.modelsTok[k]
+          tokens += (t.inputTokens || 0) + (t.outputTokens || 0) + (t.cacheReadTokens || 0) + (t.cacheWriteTokens || 0)
+          costCny += t.costCny || 0
         }
       }
-      return t
-        ? { tokens: (t.inputTokens || 0) + (t.outputTokens || 0) + (t.cacheReadTokens || 0) + (t.cacheWriteTokens || 0), costCny: t.costCny || 0 }
-        : { tokens: 0, costCny: 0 }
+      return { tokens, costCny }
     }
     // 价格表内的模型（flash / pro）两两对比；选中模型排前并标注
     current.modelsActual = Object.keys(PRICES)
@@ -454,17 +457,17 @@ export function apply(ctx) {
     current.selectedActual = selectedModel ? modelTokens(selectedModel.model) : { tokens: 0, costCny: 0 }
     // 实时三档拆分（摘要条悬停用）：当前选中模型 + 全局总计，口径统一、三档之和 = 合计
     const rawModelRow = (m) => {
-      const map = currentRow.modelsTok || {}
-      let t = map[m] || null
-      if (!t) {
-        for (const k of Object.keys(map)) {
-          if (k.startsWith(m + '-') || k.startsWith(m + '_')) {
-            t = map[k]
-            break
-          }
+      const row = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 }
+      for (const k of Object.keys(currentRow.modelsTok || {})) {
+        if (k === m || k.startsWith(m + '-') || k.startsWith(m + '_')) {
+          const t = currentRow.modelsTok[k]
+          row.inputTokens += t.inputTokens || 0
+          row.outputTokens += t.outputTokens || 0
+          row.cacheReadTokens += t.cacheReadTokens || 0
+          row.cacheWriteTokens += t.cacheWriteTokens || 0
         }
       }
-      return t || { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 }
+      return row
     }
     const now = new Date()
     current.selectedBreakdown = selectedModel
