@@ -114,6 +114,39 @@ export function apply(ctx) {
     }, SAVE_DEBOUNCE_MS)
   }
 
+  // SSE 实时推送：模型选择变化 / 用量产生时通知浏览器，避免轮询延迟
+  const sseClients = new Set()
+  let lastUsageBroadcast = 0
+  const sseBroadcast = (data) => {
+    const payload = 'data: ' + JSON.stringify(data) + '\n\n'
+    for (const client of sseClients) {
+      try {
+        client.write(payload)
+      } catch {
+        // 忽略单个断连客户端
+      }
+    }
+  }
+  const maybeBroadcastUsage = () => {
+    const now = Date.now()
+    if (now - lastUsageBroadcast < 2000) return
+    lastUsageBroadcast = now
+    sseBroadcast({ type: 'usage' })
+  }
+  const heartbeat = setInterval(() => {
+    for (const client of sseClients) {
+      try {
+        client.write(': ping\n\n')
+      } catch {
+        // 忽略
+      }
+    }
+  }, 30000)
+  // 会话模型选择变化（用户切换模型）→ 即时推送
+  ctx.on('settings/updated', (ns) => {
+    if (String(ns) === 'agent-default-model') sseBroadcast({ type: 'selection' })
+  })
+
   // 统计 DeepSeek 路由的每次模型调用：总计 + 按会话；费用按调用时刻的时段计价
   ctx.on('llm/stream', (options, next) => {
     const stream = next()
@@ -168,6 +201,7 @@ export function apply(ctx) {
             s.models[model] = (s.models[model] || 0) + 1
           }
           scheduleSave()
+          maybeBroadcastUsage()
         }
         yield chunk
       }
@@ -292,6 +326,20 @@ export function apply(ctx) {
         sendJson(res, usageSnapshot(url.searchParams.get('sessionId')))
       },
     }))
+    disposers.push(ctx.webServer.register({
+      kind: 'exact',
+      path: '/__dsh-balance-and-cost/events',
+      handler: (req, res) => {
+        res.writeHead(200, {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          Connection: 'keep-alive',
+        })
+        res.write('retry: 5000\n\n')
+        sseClients.add(res)
+        req.on('close', () => sseClients.delete(res))
+      },
+    }))
   }
 
   ctx.on('dispose', () => {
@@ -299,6 +347,15 @@ export function apply(ctx) {
       clearTimeout(saveTimer)
       saveTimer = null
     }
+    clearInterval(heartbeat)
+    for (const client of sseClients) {
+      try {
+        client.end()
+      } catch {
+        // 忽略
+      }
+    }
+    sseClients.clear()
     saveStats(stats)
     for (const dispose of disposers) {
       try {

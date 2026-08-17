@@ -188,8 +188,20 @@ if (typeof window !== 'undefined' && typeof window.__ModuleLoader__ !== 'undefin
             }
             React.useEffect(() => {
               load()
-              if (!timer) return undefined
-              return timer.interval(load, REFRESH_MS)
+              // SSE 实时推送：模型切换 / 用量产生 → 立即刷新（15s 轮询仅作断连兜底）
+              let es = null
+              try {
+                es = new EventSource('/__dsh-balance-and-cost/events')
+                es.onmessage = () => { load() }
+              } catch {
+                es = null
+              }
+              if (!timer) return () => { if (es) es.close() }
+              const poll = timer.interval(load, REFRESH_MS)
+              return () => {
+                poll()
+                if (es) es.close()
+              }
             }, [sessionId])
 
             const balText = balance && balance.ok
