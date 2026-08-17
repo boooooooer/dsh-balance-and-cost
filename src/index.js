@@ -361,6 +361,24 @@ export function apply(ctx) {
     const sessions = []
     for (const id of Object.keys(stats.sessions)) {
       const s = stats.sessions[id]
+      // 固定列出价格表内两个模型的明细；未调用过的模型给 0 占位
+      const modelsDetail = Object.keys(PRICES).map((m) => {
+        let t = (s.modelsTok && s.modelsTok[m]) || null
+        if (!t && s.modelsTok) {
+          for (const k of Object.keys(s.modelsTok)) {
+            if (k.startsWith(m + '-') || k.startsWith(m + '_')) {
+              t = s.modelsTok[k]
+              break
+            }
+          }
+        }
+        return {
+          model: m,
+          calls: s.models[m] || 0,
+          tokens: t ? (t.inputTokens || 0) + (t.outputTokens || 0) + (t.cacheReadTokens || 0) + (t.cacheWriteTokens || 0) : 0,
+          costCny: t ? t.costCny || 0 : 0,
+        }
+      })
       sessions.push({
         sessionId: id,
         title: await titleOf(id),
@@ -372,6 +390,7 @@ export function apply(ctx) {
         reasoningTokens: s.reasoningTokens,
         costCny: s.costCny,
         models: Object.keys(s.models).sort((a, b) => (s.models[b] || 0) - (s.models[a] || 0)),
+        modelsDetail,
       })
     }
     sessions.sort((a, b) => (b.inputTokens + b.outputTokens) - (a.inputTokens + a.outputTokens))
