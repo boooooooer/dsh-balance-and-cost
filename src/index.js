@@ -288,13 +288,6 @@ export function apply(ctx) {
     const totals = rowView(stats.totals)
     totals.anyEstimated = stats.totals.anyEstimated
     totals.perModel = perModel
-    const current = rowView(currentRow)
-    // 当前会话模型明细（含调用次数，供摘要条悬停展开）
-    current.modelsDetail = currentRow.models
-      ? Object.keys(currentRow.models)
-        .map((m) => ({ model: m, calls: currentRow.models[m] }))
-        .sort((a, b) => b.calls - a.calls)
-      : []
     // 会话当前选中的模型（agentDefaultModel：用户切换模型即时生效；未产生调用时用于即时显示）
     let selectedModel = null
     const defaultModelService = ctx.get('agentDefaultModel')
@@ -304,6 +297,22 @@ export function apply(ctx) {
         selectedModel = { provider: String(sel.provider || ''), model: String(sel.model) }
       }
     }
+    const current = rowView(currentRow)
+    // 当前会话模型明细（含调用次数，供摘要条悬停展开）。
+    // 只统计真实调用过的模型——选中但未调用绝不进入列表；
+    // 排序：当前选中的模型优先，其余按调用次数降序。
+    current.modelsDetail = currentRow.models
+      ? Object.keys(currentRow.models)
+        .map((m) => ({
+          model: m,
+          calls: currentRow.models[m],
+          selected: selectedModel !== null && m === selectedModel.model,
+        }))
+        .sort((a, b) => {
+          if (a.selected !== b.selected) return a.selected ? -1 : 1
+          return b.calls - a.calls
+        })
+      : []
     return {
       startedAt: stats.startedAt,
       totals,

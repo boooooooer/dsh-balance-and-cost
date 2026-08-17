@@ -234,7 +234,7 @@ if (typeof window !== 'undefined' && typeof window.__ModuleLoader__ !== 'undefin
                 // 多模型混用时悬停展开明细（与默认 stats 行同款 Tooltip）
                 if (curModels && curModels.length > 1 && Tooltip !== null) {
                   const detail = (usage.current.modelsDetail || [])
-                    .map((m) => m.model + ' ×' + m.calls)
+                    .map((m) => m.model + (m.selected ? '（当前选中）' : '') + ' ×' + m.calls)
                     .join(' · ')
                   if (detail) labelEl = React.createElement(Tooltip, { label: detail, side: 'top', delayMs: 500 }, labelEl)
                 }
