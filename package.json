@@ -1,0 +1,44 @@
+{
+  "name": "dsh-balance-and-cost",
+  "version": "0.1.0",
+  "description": "DeepSeek 账户余额与模型消耗量：官方价格表分高峰/空闲时段计价，按模型与会话统计，主页摘要条 + 插件中心面板。",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.js",
+    "./client": "./src/client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  },
+  "files": [
+    "src",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "plugin",
+    "dsh-plugin",
+    "balance",
+    "cost",
+    "usage",
+    "tokens"
+  ],
+  "license": "MIT",
+  "scripts": {
+    "test": "node test/smoke.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/boooooooer/dsh-balance-and-cost.git"
+  }
+}
