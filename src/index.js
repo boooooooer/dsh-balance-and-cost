@@ -354,13 +354,28 @@ export function apply(ctx) {
     const totals = rowView(stats.totals)
     totals.anyEstimated = stats.totals.anyEstimated
     totals.perModel = perModel
-    // 会话当前选中的模型（agentDefaultModel：用户切换模型即时生效；未产生调用时用于即时显示）
+    // 会话当前选中的模型：优先读该会话最近的请求配置（会话日志 requestHeader，
+    // 持久化、按会话隔离——切到哪个对话框就显示哪个），否则回退全局默认。
     let selectedModel = null
-    const defaultModelService = ctx.get('agentDefaultModel')
-    if (defaultModelService && typeof defaultModelService.currentSelection === 'function') {
-      const sel = defaultModelService.currentSelection()
-      if (sel && sel.model) {
-        selectedModel = { provider: String(sel.provider || ''), model: String(sel.model) }
+    if (sid) {
+      const agentsService = ctx.get('agents')
+      if (agentsService && typeof agentsService.get === 'function') {
+        const agent = agentsService.get(sid)
+        if (agent && agent.session && typeof agent.session.requestHeader === 'function') {
+          const header = agent.session.requestHeader()
+          if (header && header.config && header.config.model) {
+            selectedModel = { provider: String(header.config.provider || ''), model: String(header.config.model) }
+          }
+        }
+      }
+    }
+    if (selectedModel === null) {
+      const defaultModelService = ctx.get('agentDefaultModel')
+      if (defaultModelService && typeof defaultModelService.currentSelection === 'function') {
+        const sel = defaultModelService.currentSelection()
+        if (sel && sel.model) {
+          selectedModel = { provider: String(sel.provider || ''), model: String(sel.model) }
+        }
       }
     }
     const current = rowView(currentRow)
