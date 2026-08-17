@@ -175,9 +175,14 @@ if (typeof window !== 'undefined' && typeof window.__ModuleLoader__ !== 'undefin
               if (tot.perModel && tot.perModel.length) {
                 usageCard.push(React.createElement('div', { className: 'dsbal-title', key: 'mt' }, '按模型明细'))
                 usageCard.push(React.createElement('div', { className: 'dsbal-grid', key: 'mg' },
-                  tot.perModel.map((r) => React.createElement('div', { key: r.model },
-                    React.createElement('span', null, r.model + (r.estimated ? '（估算）' : '')),
-                    fmtNum(r.calls) + ' 次 · ' + fmtNum(r.inputTokens + r.outputTokens) + ' tok ≈' + fmtCostShort(r.costCny)))))
+                  tot.perModel.map((r) => {
+                    const miss = (r.inputTokens || 0) + (r.cacheWriteTokens || 0)
+                    const hit = r.cacheReadTokens || 0
+                    const out = r.outputTokens || 0
+                    return React.createElement('div', { key: r.model },
+                      React.createElement('span', null, r.model + (r.estimated ? '（估算）' : '')),
+                      fmtNum(r.calls) + ' 次 · ' + fmtCompact(miss + hit + out) + ' tok ≈' + fmtCostShort(r.costCny))
+                  })))
               }
               if (usage.sessions && usage.sessions.length) {
                 usageCard.push(React.createElement('div', { className: 'dsbal-title', key: 'st' }, '各会话消耗'))
