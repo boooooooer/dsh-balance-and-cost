@@ -221,20 +221,24 @@ if (typeof window !== 'undefined' && typeof window.__ModuleLoader__ !== 'undefin
             let totText = '总计 —'
             if (usage) {
               const curModels = modelsOf(usage.current)
+              // 显示优先级：当前选中的模型 > 实际调用过的模型（切换即跟随）
               let curLabel = null
-              if (curModels) {
-                curLabel = curModels.length === 1 ? curModels[0] : curModels.length + ' 模型'
-              } else if (usage.selectedModel && usage.selectedModel.model) {
+              if (usage.selectedModel && usage.selectedModel.model) {
                 curLabel = usage.selectedModel.model
+              } else if (curModels) {
+                curLabel = curModels.length === 1 ? curModels[0] : curModels.length + ' 模型'
               }
               totText = '总计 ' + fmtNum(tokOf(usage.totals)) + ' tok ≈' + fmtCostShort(usage.totals.costCny)
-              const tokText = fmtNum(tokOf(usage.current)) + ' tok ≈' + fmtCostShort(usage.current.costCny)
+              // 本会话格显示当前选中模型的实际消耗（≈¥ 即估算费用）
+              const act = usage.current.selectedActual
+              const hasAct = act && act.tokens > 0
+              const tokText = (hasAct ? fmtNum(act.tokens) : fmtNum(tokOf(usage.current))) + ' tok ≈' + fmtCostShort(hasAct ? act.costCny : usage.current.costCny)
               if (curLabel) {
                 let labelEl = React.createElement('span', { className: 'dsbal-models' }, curLabel)
-                // 多模型混用时悬停展开明细（与默认 stats 行同款 Tooltip）
-                if (curModels && curModels.length > 1 && Tooltip !== null) {
-                  const detail = (usage.current.modelsDetail || [])
-                    .map((m) => m.model + (m.selected ? '（当前选中）' : '') + ' ×' + m.calls)
+                // 模型名上悬停：两模型实际消耗量与估算价对比（与默认 stats 行同款 Tooltip）
+                if (Tooltip !== null) {
+                  const detail = (usage.current.modelsActual || [])
+                    .map((m) => m.model + (m.selected ? '（当前）' : '') + '：' + fmtNum(m.tokens) + ' tok ≈' + fmtCostShort(m.costCny))
                     .join(' · ')
                   if (detail) labelEl = React.createElement(Tooltip, { label: detail, side: 'top', delayMs: 500 }, labelEl)
                 }

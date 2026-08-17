@@ -70,7 +70,7 @@ function emptyTotals() {
 }
 
 function emptySession() {
-  return { calls: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, costCny: 0, models: {} }
+  return { calls: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, costCny: 0, models: {}, modelsTok: {} }
 }
 
 function loadStats() {
@@ -209,6 +209,17 @@ export function apply(ctx) {
             s.reasoningTokens += rt
             s.costCny += cost
             s.models[model] = (s.models[model] || 0) + 1
+            // 按模型细分 token（供「当前模型实际消耗」与悬停两模型对比）
+            let mt = s.modelsTok[model]
+            if (!mt) {
+              mt = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, costCny: 0 }
+              s.modelsTok[model] = mt
+            }
+            mt.inputTokens += i
+            mt.outputTokens += o
+            mt.cacheReadTokens += cr
+            mt.cacheWriteTokens += cw
+            mt.costCny += cost
           }
           scheduleSave()
           maybeBroadcastUsage()
@@ -298,21 +309,26 @@ export function apply(ctx) {
       }
     }
     const current = rowView(currentRow)
-    // 当前会话模型明细（含调用次数，供摘要条悬停展开）。
-    // 只统计真实调用过的模型——选中但未调用绝不进入列表；
-    // 排序：当前选中的模型优先，其余按调用次数降序。
-    current.modelsDetail = currentRow.models
-      ? Object.keys(currentRow.models)
-        .map((m) => ({
-          model: m,
-          calls: currentRow.models[m],
-          selected: selectedModel !== null && m === selectedModel.model,
-        }))
-        .sort((a, b) => {
-          if (a.selected !== b.selected) return a.selected ? -1 : 1
-          return b.calls - a.calls
-        })
-      : []
+    // 当前会话按模型的实际消耗（实时累计值，供摘要条「本会话(当前选中模型)」与悬停两模型对比）。
+    // 只统计真实调用过的模型——选中但未调用绝不进入列表。
+    const modelTokens = (m) => {
+      const t = (currentRow.modelsTok && currentRow.modelsTok[m]) || null
+      return t
+        ? { tokens: (t.inputTokens || 0) + (t.outputTokens || 0) + (t.cacheReadTokens || 0) + (t.cacheWriteTokens || 0), costCny: t.costCny || 0 }
+        : { tokens: 0, costCny: 0 }
+    }
+    // 价格表内的模型（flash / pro）两两对比；选中模型排前并标注
+    current.modelsActual = Object.keys(PRICES)
+      .map((m) => {
+        const v = modelTokens(m)
+        return { model: m, tokens: v.tokens, costCny: v.costCny, selected: selectedModel !== null && m === selectedModel.model }
+      })
+      .sort((a, b) => {
+        if (a.selected !== b.selected) return a.selected ? -1 : 1
+        return b.tokens - a.tokens
+      })
+    // 当前选中模型的实际消耗（本会话格直接显示）
+    current.selectedActual = selectedModel ? modelTokens(selectedModel.model) : { tokens: 0, costCny: 0 }
     return {
       startedAt: stats.startedAt,
       totals,
