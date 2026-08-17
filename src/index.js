@@ -36,9 +36,19 @@ export function isPeak(date) {
   return (h >= 9 && h < 12) || (h >= 14 && h < 18)
 }
 
+// 解析模型名 → 价格表条目。先精确匹配，再按前缀匹配以覆盖带版本后缀的
+// 模型 id（如 deepseek-v4-pro-0813 匹配 deepseek-v4-pro）。
+function resolvePriceTable(model) {
+  const m = String(model || '')
+  for (const key of Object.keys(PRICES)) {
+    if (m === key || m.startsWith(key + '-') || m.startsWith(key + '_')) return PRICES[key]
+  }
+  return undefined
+}
+
 // 返回该时刻的具体单价（元/百万 tokens）
 export function priceFor(model, date) {
-  const table = PRICES[model] || FALLBACK
+  const table = resolvePriceTable(model) || FALLBACK
   const peak = isPeak(date)
   const pick = (v) => (peak ? v.peak : v.off)
   return {
@@ -46,7 +56,7 @@ export function priceFor(model, date) {
     cacheRead: pick(table.inputHit),
     cacheWrite: pick(table.inputMiss),
     output: pick(table.output),
-    estimated: !PRICES[model],
+    estimated: resolvePriceTable(model) === undefined,
     peak,
   }
 }

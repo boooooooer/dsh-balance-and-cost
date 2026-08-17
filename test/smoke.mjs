@@ -37,6 +37,15 @@ const proPeak = priceFor('deepseek-v4-pro', new Date('2026-08-17T02:00:00Z'))
 assert.deepEqual(proPeak, {
   input: 9.0, cacheRead: 0.3, cacheWrite: 9.0, output: 27.0, estimated: false, peak: true,
 })
+// 带版本后缀的模型 id（官方版本号如 DeepSeek-V4-Pro-0813）应前缀匹配正确价格
+const proSuffixPeak = priceFor('deepseek-v4-pro-0813', new Date('2026-08-17T02:00:00Z'))
+assert.deepEqual(proSuffixPeak, {
+  input: 9.0, cacheRead: 0.3, cacheWrite: 9.0, output: 27.0, estimated: false, peak: true,
+})
+const flashSuffixOff = priceFor('deepseek-v4-flash-0731', new Date('2026-08-17T04:00:00Z'))
+assert.deepEqual(flashSuffixOff, {
+  input: 1.5, cacheRead: 0.05, cacheWrite: 1.5, output: 4.5, estimated: false, peak: false,
+})
 const unknown = priceFor('deepseek-v9-unknown', new Date('2026-08-17T02:00:00Z'))
 assert.equal(unknown.estimated, true, '未收录模型应标记估算并按 v4-flash 兜底')
 assert.equal(unknown.input, 3.0)
