@@ -72,6 +72,22 @@ if (typeof window !== 'undefined' && typeof window.__ModuleLoader__ !== 'undefin
           const fmtTime = (t) => (typeof t === 'number' ? new Date(t).toLocaleTimeString('zh-CN') : '—')
           const tokOf = (u) => (u ? (u.inputTokens || 0) + (u.outputTokens || 0) : 0)
           const modelsOf = (u) => (u && Array.isArray(u.models) && u.models.length ? u.models : null)
+          // 数字缩略：≥1M → 4.5M；≥1K → 477K；其余取整
+          const fmtCompact = (n) => {
+            if (typeof n !== 'number' || !Number.isFinite(n)) return '—'
+            const abs = Math.abs(n)
+            if (abs >= 1e6) return (n / 1e6).toFixed(1) + 'M'
+            if (abs >= 1e3) return (n / 1e3).toFixed(1) + 'K'
+            return String(Math.round(n))
+          }
+          // 三档明细（悬停用，与官方计费口径一致；三档之和 = 合计）
+          const fmtBreakdown = (bd) => {
+            if (!bd) return ''
+            return '输入·缓存未命中：' + fmtNum(bd.missTokens) + ' tok ≈' + fmtCost(bd.missCostCny)
+              + '\n输入·缓存命中：' + fmtNum(bd.hitTokens) + ' tok ≈' + fmtCost(bd.hitCostCny)
+              + '\n输出：' + fmtNum(bd.outputTokens) + ' tok ≈' + fmtCost(bd.outputCostCny)
+              + '\n合计：' + fmtNum(bd.totalTokens) + ' tok ≈' + fmtCost(bd.totalCostCny)
+          }
           const timer = ctx.get('timer')
 
           const panelSeq = { v: 0 }
@@ -218,7 +234,7 @@ if (typeof window !== 'undefined' && typeof window.__ModuleLoader__ !== 'undefin
               : (balance && !balance.ok ? '余额—' : '余额…')
 
             let curNodes = React.createElement('span', null, '本会话 —')
-            let totText = '总计 —'
+            let totNodes = React.createElement('span', null, '总计 —')
             if (usage) {
               const curModels = modelsOf(usage.current)
               // 显示优先级：当前选中的模型 > 实际调用过的模型（切换即跟随）
@@ -228,11 +244,20 @@ if (typeof window !== 'undefined' && typeof window.__ModuleLoader__ !== 'undefin
               } else if (curModels) {
                 curLabel = curModels.length === 1 ? curModels[0] : curModels.length + ' 模型'
               }
-              totText = '总计 ' + fmtNum(tokOf(usage.totals)) + ' tok ≈' + fmtCostShort(usage.totals.costCny)
-              // 本会话格显示当前选中模型的实际消耗（≈¥ 即估算费用）
-              const act = usage.current.selectedActual
-              const hasAct = act && act.tokens > 0
-              const tokText = (hasAct ? fmtNum(act.tokens) : fmtNum(tokOf(usage.current))) + ' tok ≈' + fmtCostShort(hasAct ? act.costCny : usage.current.costCny)
+              const selBd = usage.current && usage.current.selectedBreakdown
+              const totBd = usage.totals && usage.totals.breakdown
+              // token 数字（M/K 缩略），悬停显示三档明细（官方口径）
+              const tokEl = (bd) => {
+                const el = React.createElement('span', { className: 'dsbal-models' }, fmtCompact(bd.totalTokens) + ' tok')
+                if (Tooltip === null) return el
+                const detail = fmtBreakdown(bd)
+                return detail ? React.createElement(Tooltip, { label: detail, side: 'top', delayMs: 500 }, el) : el
+              }
+              if (totBd) {
+                totNodes = React.createElement('span', null, '总计 ', React.createElement('span', null, fmtCompact(totBd.totalTokens) + ' tok'), ' ≈' + fmtCostShort(totBd.totalCostCny))
+              } else {
+                totNodes = React.createElement('span', null, '总计 ' + fmtNum(tokOf(usage.totals)) + ' tok ≈' + fmtCostShort(usage.totals.costCny))
+              }
               if (curLabel) {
                 let labelEl = React.createElement('span', { className: 'dsbal-models' }, curLabel)
                 // 模型名上悬停：两模型实际消耗量与估算价对比（与默认 stats 行同款 Tooltip）
@@ -242,9 +267,13 @@ if (typeof window !== 'undefined' && typeof window.__ModuleLoader__ !== 'undefin
                     .join(' · ')
                   if (detail) labelEl = React.createElement(Tooltip, { label: detail, side: 'top', delayMs: 500 }, labelEl)
                 }
-                curNodes = React.createElement('span', null, '本会话 (', labelEl, ') ', tokText)
+                if (selBd) {
+                  curNodes = React.createElement('span', null, '本会话 (', labelEl, ') ', tokEl(selBd), ' ≈' + fmtCostShort(selBd.totalCostCny))
+                } else {
+                  curNodes = React.createElement('span', null, '本会话 (', labelEl, ') ' + fmtNum(tokOf(usage.current)) + ' tok ≈' + fmtCostShort(usage.current.costCny))
+                }
               } else {
-                curNodes = React.createElement('span', null, '本会话 ', tokText)
+                curNodes = React.createElement('span', null, '本会话 ', selBd ? tokEl(selBd) : fmtNum(tokOf(usage.current)) + ' tok', selBd ? ' ≈' + fmtCostShort(selBd.totalCostCny) : ' ≈' + fmtCostShort(usage.current.costCny))
               }
             }
 
@@ -253,7 +282,7 @@ if (typeof window !== 'undefined' && typeof window.__ModuleLoader__ !== 'undefin
               React.createElement('span', { key: 'sep1', className: 'dsbal-sep' }, '·'),
               React.createElement('span', { key: 'c' }, curNodes),
               React.createElement('span', { key: 'sep2', className: 'dsbal-sep' }, '·'),
-              React.createElement('span', { key: 't' }, totText),
+              React.createElement('span', { key: 't' }, totNodes),
             ]
             if (usage) {
               nodes.push(React.createElement('span', { key: 'sep3', className: 'dsbal-sep' }, '·'))

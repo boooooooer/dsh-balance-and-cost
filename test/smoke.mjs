@@ -2,7 +2,7 @@
 // 运行：node test/smoke.mjs
 import { readFileSync } from 'node:fs'
 import assert from 'node:assert/strict'
-import { isPeak, priceFor } from '../src/index.js'
+import { isPeak, priceFor, usageBreakdown } from '../src/index.js'
 
 const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
 
@@ -49,6 +49,20 @@ assert.deepEqual(flashSuffixOff, {
 const unknown = priceFor('deepseek-v9-unknown', new Date('2026-08-17T02:00:00Z'))
 assert.equal(unknown.estimated, true, '未收录模型应标记估算并按 v4-flash 兜底')
 assert.equal(unknown.input, 3.0)
+
+// 三档拆分（官方计费口径）：缓存未命中含缓存写入；三档之和 = 合计；费用按当前时段单价
+const bd = usageBreakdown(
+  { inputTokens: 1000000, outputTokens: 1000, cacheReadTokens: 4000000, cacheWriteTokens: 500000 },
+  'deepseek-v4-flash',
+  new Date('2026-08-17T04:00:00Z'), // 空闲时段：未命中 1.5 / 命中 0.05 / 输出 4.5
+)
+assert.equal(bd.missTokens, 1500000, '缓存未命中应含缓存写入')
+assert.equal(bd.hitTokens, 4000000)
+assert.equal(bd.outputTokens, 1000)
+assert.equal(bd.totalTokens, 5501000, '三档之和 = 合计')
+const expectCost = (1500000 * 1.5 + 4000000 * 0.05 + 1000 * 4.5) / 1e6
+assert.ok(Math.abs(bd.totalCostCny - expectCost) < 1e-9, '费用 = 三档各自单价之和')
+assert.ok(Math.abs(bd.missCostCny + bd.hitCostCny + bd.outputCostCny - bd.totalCostCny) < 1e-12, '三档费用之和 = 合计费用')
 
 // browser half：Node 环境下加载不应有副作用、不应抛错
 await import('../src/client.js')

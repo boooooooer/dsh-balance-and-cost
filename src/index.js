@@ -113,6 +113,58 @@ function sendJson(res, value, status = 200) {
   res.end(body)
 }
 
+// 三档用量拆分（与官方计费口径一致）：输入·缓存未命中（含缓存写入，官方按未命中价收）/
+// 输入·缓存命中 / 输出；费用按当前时段单价实时计算，三档费用之和 = 合计。
+export function usageBreakdown(row, model, date) {
+  const p = priceFor(model, date)
+  const miss = (row.inputTokens || 0) + (row.cacheWriteTokens || 0)
+  const hit = row.cacheReadTokens || 0
+  const out = row.outputTokens || 0
+  const missCost = miss * p.input / 1e6
+  const hitCost = hit * p.cacheRead / 1e6
+  const outCost = out * p.output / 1e6
+  return {
+    missTokens: miss,
+    hitTokens: hit,
+    outputTokens: out,
+    totalTokens: miss + hit + out,
+    missCostCny: missCost,
+    hitCostCny: hitCost,
+    outputCostCny: outCost,
+    totalCostCny: missCost + hitCost + outCost,
+  }
+}
+
+// 全局总计的三档汇总：按每个模型各自的单价分别计算后相加
+function totalsBreakdown(stats, date) {
+  let miss = 0
+  let hit = 0
+  let out = 0
+  let missC = 0
+  let hitC = 0
+  let outC = 0
+  for (const key of Object.keys(stats.totals.perModel)) {
+    const r = stats.totals.perModel[key]
+    const b = usageBreakdown(r, r.model, date)
+    miss += b.missTokens
+    hit += b.hitTokens
+    out += b.outputTokens
+    missC += b.missCostCny
+    hitC += b.hitCostCny
+    outC += b.outputCostCny
+  }
+  return {
+    missTokens: miss,
+    hitTokens: hit,
+    outputTokens: out,
+    totalTokens: miss + hit + out,
+    missCostCny: missC,
+    hitCostCny: hitC,
+    outputCostCny: outC,
+    totalCostCny: missC + hitC + outC,
+  }
+}
+
 export function apply(ctx) {
   const stats = loadStats() || { startedAt: Date.now(), totals: emptyTotals(), sessions: {}, baseline: null }
   let saveTimer = null
@@ -342,6 +394,25 @@ export function apply(ctx) {
       })
     // 当前选中模型的实际消耗（本会话格直接显示）
     current.selectedActual = selectedModel ? modelTokens(selectedModel.model) : { tokens: 0, costCny: 0 }
+    // 实时三档拆分（摘要条悬停用）：当前选中模型 + 全局总计，口径统一、三档之和 = 合计
+    const rawModelRow = (m) => {
+      const map = currentRow.modelsTok || {}
+      let t = map[m] || null
+      if (!t) {
+        for (const k of Object.keys(map)) {
+          if (k.startsWith(m + '-') || k.startsWith(m + '_')) {
+            t = map[k]
+            break
+          }
+        }
+      }
+      return t || { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 }
+    }
+    const now = new Date()
+    current.selectedBreakdown = selectedModel
+      ? usageBreakdown(rawModelRow(selectedModel.model), selectedModel.model, now)
+      : null
+    totals.breakdown = totalsBreakdown(stats, now)
     return {
       startedAt: stats.startedAt,
       totals,
