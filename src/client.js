@@ -263,7 +263,7 @@ if (typeof window !== 'undefined' && typeof window.__ModuleLoader__ !== 'undefin
                 // 模型名上悬停：两模型实际消耗量与估算价对比（与默认 stats 行同款 Tooltip）
                 if (Tooltip !== null) {
                   const detail = (usage.current.modelsActual || [])
-                    .map((m) => m.model + (m.selected ? '（当前）' : '') + '：' + fmtNum(m.tokens) + ' tok ≈' + fmtCostShort(m.costCny))
+                    .map((m) => m.model + (m.selected ? '（上次调用）' : '') + '：' + fmtNum(m.tokens) + ' tok ≈' + fmtCostShort(m.costCny))
                     .join(' · ')
                   if (detail) labelEl = React.createElement(Tooltip, { label: detail, side: 'top', delayMs: 500 }, labelEl)
                 }
