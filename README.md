@@ -2,7 +2,7 @@
 
 DeepSeek Harness（DSH）标准 bundle 插件：显示 **DeepSeek 账户余额** 与 **模型消耗量**。
 
-- 主页输入框下方实时摘要条：`DeepSeek 余额 ¥xx.xx CNY · 本会话 (deepseek-v4-flash) xxx tok ≈¥x.xxx · 总计 xxx tok ≈¥x.xxx · [高峰/空闲]`
+- 主页输入框下方实时摘要条：`DeepSeek 余额 ¥xx.xx CNY · 本会话（会话正在使用的模型） xxx tok ≈¥x.xxx · 总计 xxx tok ≈¥x.xxx · [高峰/空闲]`（「会话正在使用的模型」为动态变量，显示当前会话实际调用的模型名，如 `deepseek-v4-flash`）
 - 插件中心（设置 → 插件）「DeepSeek 用量」标签页：余额明细 + 完整用量面板
 
 纯 JavaScript、零依赖、零构建——GitHub 直装无需构建授权。
