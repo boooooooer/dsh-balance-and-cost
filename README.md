@@ -7,6 +7,12 @@ DeepSeek Harness（DSH）标准 bundle 插件：显示 **DeepSeek 账户余额**
 
 纯 JavaScript、零依赖、零构建——GitHub 直装无需构建授权。
 
+## 界面预览
+
+![主页摘要条](assets/screenshot-1.png)
+
+![设置页「DeepSeek 用量」面板](assets/screenshot-2.png)
+
 ## 功能特性
 
 | 功能 | 说明 |
