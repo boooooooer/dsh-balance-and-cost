@@ -1,0 +1,6 @@
+# Bundle patch layer shipped by the dsh-balance-and-cost package.
+# When the package is active in a profile (dsh.profile.bundles), this layer
+# is applied to the composition and mounts the plugin row.
+- insert:
+    - id: dsh-balance-and-cost
+      name: dsh-balance-and-cost
