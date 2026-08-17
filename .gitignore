@@ -1,0 +1,4 @@
+node_modules/
+.firecrawl/
+*.log
+.DS_Store
