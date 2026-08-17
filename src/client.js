@@ -59,6 +59,11 @@ if (typeof window !== 'undefined' && typeof window.__ModuleLoader__ !== 'undefin
             .dsbal-sum b { color: var(--dsw-alias-label-primary); font-weight: 600; font-variant-numeric: tabular-nums; }
             .dsbal-sep { opacity: 0.45; }
             .dsbal-models { cursor: help; border-bottom: 1px dotted var(--dsw-alias-border-l2); }
+            .dsbal-sess-list { display: flex; flex-direction: column; gap: 10px; margin-top: 10px; }
+            .dsbal-sess { border: 1px solid var(--dsw-alias-border-l1); border-radius: 8px; padding: 8px 10px; background: var(--dsw-alias-bg-layer-2); }
+            .dsbal-sess-title { font-size: 13px; font-weight: 600; color: var(--dsw-alias-label-primary); }
+            .dsbal-sess-model { font-size: 12px; color: var(--dsw-alias-label-secondary); margin-left: 10px; }
+            .dsbal-sess-stats { font-size: 12px; color: var(--dsw-alias-label-secondary); margin-top: 4px; }
           `
           document.head.appendChild(styleEl)
           ctx.on('dispose', () => {
@@ -176,27 +181,31 @@ if (typeof window !== 'undefined' && typeof window.__ModuleLoader__ !== 'undefin
               }
               if (usage.sessions && usage.sessions.length) {
                 usageCard.push(React.createElement('div', { className: 'dsbal-title', key: 'st' }, '各会话消耗'))
-                usageCard.push(React.createElement('div', { className: 'dsbal-grid', key: 'sg' },
-                  usage.sessions.map((s) => React.createElement('div', { key: s.sessionId },
-                    React.createElement('span', null,
-                      (s.title || '会话 ' + String(s.sessionId).slice(0, 8))
-                      + (s.models && s.models.length === 1 ? ' · ' + s.models[0] : '')),
-                    fmtNum(s.calls) + ' 次 · ' + fmtNum(s.inputTokens + s.outputTokens) + ' tok ≈' + fmtCostShort(s.costCny)))))
+                usageCard.push(React.createElement('div', { className: 'dsbal-sess-list', key: 'sg' },
+                  usage.sessions.map((s) => React.createElement('div', { className: 'dsbal-sess', key: s.sessionId },
+                    React.createElement('div', { className: 'dsbal-sess-title' }, s.title || '会话 ' + String(s.sessionId).slice(0, 8)),
+                    (s.models || []).map((m) => React.createElement('div', { className: 'dsbal-sess-model', key: m }, '- ' + m)),
+                    React.createElement('div', { className: 'dsbal-sess-stats' },
+                      fmtNum(s.calls) + ' 次 · ' + fmtCompact((s.inputTokens || 0) + (s.cacheReadTokens || 0) + (s.cacheWriteTokens || 0) + (s.outputTokens || 0)) + ' tok ≈' + fmtCostShort(s.costCny))))))
               }
             }
 
-            // 导出明细（CSV）：按模型 + 按会话
+            // 导出明细（CSV）：按模型 + 按会话；三档口径与界面一致（未命中 = 输入 + 缓存写入）
             const exportCsv = () => {
               if (!usage) return
+              const missOf = (r) => (r.inputTokens || 0) + (r.cacheWriteTokens || 0)
               const rows = []
               rows.push(['类型', '名称', '调用次数', '输入·未命中', '输入·命中', '输出', '合计 tok', '估算费用(CNY)'])
               const tot = usage.totals || {}
-              rows.push(['总计', '全部', tot.calls || 0, tot.inputTokens || 0, tot.cacheReadTokens || 0, tot.outputTokens || 0, (tot.inputTokens || 0) + (tot.cacheReadTokens || 0) + (tot.outputTokens || 0), (tot.costCny || 0).toFixed(6)])
+              const totMiss = missOf(tot)
+              rows.push(['总计', '全部', tot.calls || 0, totMiss, tot.cacheReadTokens || 0, tot.outputTokens || 0, totMiss + (tot.cacheReadTokens || 0) + (tot.outputTokens || 0), (tot.costCny || 0).toFixed(6)])
               for (const r of (tot.perModel || [])) {
-                rows.push(['模型', r.model, r.calls, r.inputTokens, r.cacheReadTokens, r.outputTokens, (r.inputTokens + r.cacheReadTokens + r.outputTokens), (r.costCny || 0).toFixed(6)])
+                const miss = missOf(r)
+                rows.push(['模型', r.model, r.calls, miss, r.cacheReadTokens, r.outputTokens, miss + r.cacheReadTokens + r.outputTokens, (r.costCny || 0).toFixed(6)])
               }
               for (const s of (usage.sessions || [])) {
-                rows.push(['会话', s.title || String(s.sessionId), s.calls, s.inputTokens, s.cacheReadTokens, s.outputTokens, (s.inputTokens + s.cacheReadTokens + s.outputTokens), (s.costCny || 0).toFixed(6)])
+                const miss = missOf(s)
+                rows.push(['会话', s.title || String(s.sessionId), s.calls, miss, s.cacheReadTokens, s.outputTokens, miss + s.cacheReadTokens + s.outputTokens, (s.costCny || 0).toFixed(6)])
               }
               const csv = '\uFEFF' + rows.map((r) => r.map((v) => '"' + String(v).replace(/"/g, '""') + '"').join(',')).join('\r\n')
               const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' })

@@ -371,7 +371,7 @@ export function apply(ctx) {
         cacheWriteTokens: s.cacheWriteTokens,
         reasoningTokens: s.reasoningTokens,
         costCny: s.costCny,
-        models: Object.keys(s.models),
+        models: Object.keys(s.models).sort((a, b) => (s.models[b] || 0) - (s.models[a] || 0)),
       })
     }
     sessions.sort((a, b) => (b.inputTokens + b.outputTokens) - (a.inputTokens + a.outputTokens))
