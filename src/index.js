@@ -245,6 +245,15 @@ export function apply(ctx) {
     totals.anyEstimated = stats.totals.anyEstimated
     totals.perModel = perModel
     const current = rowView(currentRow)
+    // 会话当前选中的模型（agentDefaultModel：用户切换模型即时生效；未产生调用时用于即时显示）
+    let selectedModel = null
+    const defaultModelService = ctx.get('agentDefaultModel')
+    if (defaultModelService && typeof defaultModelService.currentSelection === 'function') {
+      const sel = defaultModelService.currentSelection()
+      if (sel && sel.model) {
+        selectedModel = { provider: String(sel.provider || ''), model: String(sel.model) }
+      }
+    }
     return {
       startedAt: stats.startedAt,
       totals,
@@ -252,6 +261,7 @@ export function apply(ctx) {
       baseline: stats.baseline,
       sessions,
       peak: isPeak(new Date()),
+      selectedModel,
     }
   }
 

@@ -200,7 +200,12 @@ if (typeof window !== 'undefined' && typeof window.__ModuleLoader__ !== 'undefin
             let totText = '总计 —'
             if (usage) {
               const curModels = modelsOf(usage.current)
-              const curLabel = curModels ? (curModels.length === 1 ? curModels[0] : curModels.length + ' 模型') : null
+              let curLabel = null
+              if (curModels) {
+                curLabel = curModels.length === 1 ? curModels[0] : curModels.length + ' 模型'
+              } else if (usage.selectedModel && usage.selectedModel.model) {
+                curLabel = usage.selectedModel.model
+              }
               curText = '本会话' + (curLabel ? ' (' + curLabel + ')' : '') + ' ' + fmtNum(tokOf(usage.current)) + ' tok ≈' + fmtCostShort(usage.current.costCny)
               totText = '总计 ' + fmtNum(tokOf(usage.totals)) + ' tok ≈' + fmtCostShort(usage.totals.costCny)
             }
