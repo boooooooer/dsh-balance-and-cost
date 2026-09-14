@@ -18,36 +18,58 @@
  *     /__dsh-balance-and-cost/balance   → 余额快照
  *     /__dsh-balance-and-cost/usage     → 用量快照（?sessionId= 取当前会话维度）
  */
-import { readFileSync, writeFileSync, renameSync, mkdirSync, existsSync } from 'node:fs'
-import { dirname, join } from 'node:path'
+import { readFileSync, writeFileSync, renameSync, mkdirSync, existsSync, statSync } from 'node:fs'
+import { dirname, join, resolve } from 'node:path'
+import { homedir } from 'node:os'
 
 export const name = 'dsh-balance-and-cost'
 // webServer 由 web 组合保证提供；声明为硬依赖使 apply 等待其就绪后再运行。
 export const inject = ['webServer']
 
-// 官方价格表（api-docs.deepseek.com/zh-cn/quick_start/pricing，人民币 / 百万 tokens）：
-// deepseek-v4-flash：输入未命中 高峰3.0/空闲1.5，命中 高峰0.10/空闲0.05，输出 高峰9.0/空闲4.5
-// deepseek-v4-pro：  输入未命中 高峰9.0/空闲4.5，命中 高峰0.30/空闲0.15，输出 高峰27.0/空闲13.5
-// 高峰 = 北京时间 9-12、14-18；缓存写入按输入未命中计价；未收录模型按 deepseek-v4-flash 估算
+// 官方价格表（api-docs.deepseek.com/zh-cn/quick_start/pricing，人民币 / 百万 tokens）。
+// 2026-09-10 12:00 起生效（DeepSeek V4.1 Flash 发布，Flash 降价；V4 Pro 计费不变）：
+//   deepseek-flash（V4.1-Flash）：未命中 高峰2/空闲1，命中 高峰0.04/空闲0.02，输出 高峰8/空闲4
+//   deepseek-v4-pro（V4-Pro-0813）：未命中 高峰9/空闲4.5，命中 高峰0.30/空闲0.15，输出 高峰27/空闲13.5
+// 高峰 = 北京时间**周一至周五** 9:00-12:00、14:00-18:00（其余含周末为空闲）；
+// 缓存写入按输入未命中计价；未收录模型按 deepseek-flash 估算。
 const PRICES = {
-  'deepseek-v4-flash': { inputMiss: { peak: 3.0, off: 1.5 }, inputHit: { peak: 0.10, off: 0.05 }, output: { peak: 9.0, off: 4.5 } },
+  'deepseek-flash': { inputMiss: { peak: 2.0, off: 1.0 }, inputHit: { peak: 0.04, off: 0.02 }, output: { peak: 8.0, off: 4.0 } },
   'deepseek-v4-pro': { inputMiss: { peak: 9.0, off: 4.5 }, inputHit: { peak: 0.30, off: 0.15 }, output: { peak: 27.0, off: 13.5 } },
 }
-const FALLBACK = PRICES['deepseek-v4-flash']
+const FALLBACK_KEY = 'deepseek-flash'
+const FALLBACK = PRICES[FALLBACK_KEY]
 
+// 模型名 → 价格表 key 的别名表（官方改名/下线后旧名仍会路由到新模型并按其单价计费）：
+//   deepseek-v4-flash、deepseek-v4-flash-vision-exp  → 由 DeepSeek-V4.1-Flash 提供服务，按 Flash 计价
+//   deepseek-v4-pro-0813 等版本后缀                  → 归到 deepseek-v4-pro
+const MODEL_ALIASES = {
+  'deepseek-flash': 'deepseek-flash',
+  'deepseek-v4-flash': 'deepseek-flash',
+  'deepseek-v4-flash-vision-exp': 'deepseek-flash',
+  'deepseek-v4-pro': 'deepseek-v4-pro',
+}
+
+// 价格表元信息：版本号用于「历史分桶换表重算」的一次性迁移（见 apply 内 repriceLedger）
+export const PRICING_VERSION = 2
+export const PRICING_INFO = {
+  version: PRICING_VERSION,
+  effectiveAt: '2026-09-10T12:00:00+08:00',
+  source: 'https://api-docs.deepseek.com/zh-cn/quick_start/pricing',
+  peakRule: '高峰 = 北京时间周一至周五 9:00-12:00、14:00-18:00；其余（含周末）为空闲',
+}
+
+// 北京时间的高峰判定：工作日（周一至周五）+ 9-12 / 14-18
 export function isPeak(date) {
-  const h = (date.getUTCHours() + 8) % 24
+  const shifted = new Date(date.getTime() + 8 * 60 * 60 * 1000) // 平移后 UTC 字段 = 北京时间字段
+  const day = shifted.getUTCDay() // 0=周日 … 6=周六
+  if (day === 0 || day === 6) return false
+  const h = shifted.getUTCHours()
   return (h >= 9 && h < 12) || (h >= 14 && h < 18)
 }
 
-// 解析模型名 → 价格表条目。先精确匹配，再按前缀匹配以覆盖带版本后缀的
-// 模型 id（如 deepseek-v4-pro-0813 匹配 deepseek-v4-pro）。
+// 解析模型名 → 价格表条目。先查别名表（覆盖改名与版本后缀），未收录返回 undefined。
 function resolvePriceTable(model) {
-  const m = String(model || '')
-  for (const key of Object.keys(PRICES)) {
-    if (m === key || m.startsWith(key + '-') || m.startsWith(key + '_')) return PRICES[key]
-  }
-  return undefined
+  return PRICES[normalizeModel(model)]
 }
 
 // 返回该时刻的具体单价（元/百万 tokens）
@@ -65,14 +87,17 @@ export function priceFor(model, date) {
   }
 }
 
-// 模型名归一化到价格表 key（带版本后缀如 deepseek-v4-flash-0731 → deepseek-v4-flash），
-// 未收录模型保留原始名。归一化后的名字同时作为统计与计价缓存的 key。
+// 模型名归一化到价格表 key：先查别名（官方改名/下线后的旧名），再按别名前缀匹配版本后缀
+// （deepseek-v4-pro-0813 → deepseek-v4-pro），未收录模型保留原始名。
+// 归一化后的名字同时作为统计与计价缓存的 key。
 export function normalizeModel(model) {
-  const m = String(model || 'unknown')
-  for (const key of Object.keys(PRICES)) {
-    if (m === key || m.startsWith(key + '-') || m.startsWith(key + '_')) return key
+  const raw = String(model || 'unknown')
+  const m = raw.toLowerCase()
+  if (MODEL_ALIASES[m] !== undefined) return MODEL_ALIASES[m]
+  for (const alias of Object.keys(MODEL_ALIASES)) {
+    if (m.startsWith(alias + '-') || m.startsWith(alias + '_')) return MODEL_ALIASES[alias]
   }
-  return m
+  return raw
 }
 
 // 存储 key 与查询名的前缀匹配（兼容历史 key 分裂：deepseek-v4-flash + deepseek-v4-flash-0731）
@@ -96,7 +121,8 @@ export function modelMatches(stored, wanted) {
 //   models.*  该模型在这个小时内的调用次数、三档 token、三档真实花费、当时单价快照
 // 之后的高峰/空闲切换、跨天、进程重启都不会改变已记录的费用——
 // 展示层只做「求和」，不再用当前时间给历史 token 重新定价。
-const LEDGER_VERSION = 1
+// 计价缓存版本 = 价格表版本：两者一起递增，用于「换表重算」的一次性迁移标记
+const LEDGER_VERSION = PRICING_VERSION
 const BEIJING_OFFSET_MS = 8 * 60 * 60 * 1000
 const LEDGER_MAX_BUCKETS = 720 // 保留最近 720 个整点（30 天），更早的折叠进 settled
 const LEDGER_VIEW_MAX = 24 // 对外暴露的最近分桶行数
@@ -303,7 +329,291 @@ export function ledgerView(ledger, model) {
   }
 }
 
-const DATA_FILE = join(process.env.DSH_HOME || (process.env.HOME || '') + '/.dsh', 'dsh-balance-and-cost.json')
+// 把某作用域（总计 / 某会话）的聚合计费按「模型 → 差额」同步一次。
+// 聚合行可能按 provider:model 或历史前缀 key 分裂，这里把每个模型的差额落到第一处命中的行上。
+function applyCostDelta(scope, delta) {
+  const remaining = { ...delta }
+  const take = (name) => {
+    const key = normalizeModel(name)
+    const value = remaining[key] || 0
+    remaining[key] = 0
+    return value
+  }
+  let sum = 0
+  for (const key of Object.keys(delta)) sum += delta[key]
+  if (scope.kind === 'totals') {
+    scope.stats.totals.costCny = Math.max(0, (scope.stats.totals.costCny || 0) + sum)
+    for (const key of Object.keys(scope.stats.totals.perModel || {})) {
+      const row = scope.stats.totals.perModel[key]
+      row.costCny = Math.max(0, (row.costCny || 0) + take(row.model))
+    }
+    return sum
+  }
+  const session = scope.session
+  session.costCny = Math.max(0, (session.costCny || 0) + sum)
+  for (const key of Object.keys(session.modelsTok || {})) {
+    session.modelsTok[key].costCny = Math.max(0, (session.modelsTok[key].costCny || 0) + take(key))
+  }
+  return sum
+}
+
+// 换表重算（价格表版本变化时的一次性迁移）：
+// 把计价缓存里每个分桶按它**记录下来的时间**用新价格表重算——时间取自记录、只换表，
+// 所以不会出现「按当前时段重算历史」的突变；同时把官方改名后的旧模型 key
+// （deepseek-v4-flash*）合并到新名字下，并按新规则重判时段（如周末为空闲）。
+// 差额同步进对应作用域的聚合费用，保证界面各处一致。
+// 没有时间记录的历史 token（0.2.0 之前只有聚合值、以及被裁掉的归档分桶）不参与重算。
+export function repriceLedger(stats) {
+  const scopes = [{ kind: 'totals', stats, ledger: stats.ledger }]
+  for (const sid of Object.keys(stats.sessions || {})) {
+    scopes.push({ kind: 'session', session: stats.sessions[sid], ledger: stats.sessions[sid].ledger })
+  }
+  const costOf = (row) => (row.missCostCny || 0) + (row.hitCostCny || 0) + (row.outputCostCny || 0)
+  let repriced = false
+  for (const scope of scopes) {
+    const ledger = scope.ledger
+    if (!ledger || ledger.v === PRICING_VERSION) continue
+    const oldByModel = {}
+    const newByModel = {}
+    for (const key of Object.keys(ledger.buckets || {})) {
+      const bucket = ledger.buckets[key]
+      const at = new Date(bucket.at)
+      const peak = isPeak(at)
+      bucket.peak = peak
+      const merged = {}
+      for (const name of Object.keys(bucket.models || {})) {
+        const row = bucket.models[name]
+        const model = normalizeModel(name)
+        oldByModel[model] = (oldByModel[model] || 0) + costOf(row)
+        const price = priceFor(model, at)
+        let target = merged[model]
+        if (!target) {
+          target = {
+            peak,
+            estimated: !!price.estimated,
+            price: { input: price.input, cacheRead: price.cacheRead, cacheWrite: price.cacheWrite, output: price.output },
+            calls: 0, missTokens: 0, hitTokens: 0, outputTokens: 0,
+            missCostCny: 0, hitCostCny: 0, outputCostCny: 0,
+          }
+          merged[model] = target
+        }
+        target.calls += row.calls || 0
+        target.missTokens += row.missTokens || 0
+        target.hitTokens += row.hitTokens || 0
+        target.outputTokens += row.outputTokens || 0
+      }
+      for (const model of Object.keys(merged)) {
+        const row = merged[model]
+        const price = row.price
+        row.missCostCny = row.missTokens * price.input / 1e6
+        row.hitCostCny = row.hitTokens * price.cacheRead / 1e6
+        row.outputCostCny = row.outputTokens * price.output / 1e6
+        newByModel[model] = (newByModel[model] || 0) + costOf(row)
+      }
+      bucket.models = merged
+    }
+    const delta = {}
+    for (const model of Object.keys(oldByModel)) {
+      delta[model] = (newByModel[model] || 0) - oldByModel[model]
+    }
+    for (const model of Object.keys(newByModel)) {
+      if (oldByModel[model] !== undefined) continue
+      delta[model] = newByModel[model]
+    }
+    const sum = applyCostDelta(scope, delta)
+    ledger.costCny = Math.max(0, (ledger.costCny || 0) + sum)
+    ledger.v = PRICING_VERSION
+    repriced = true
+  }
+  return repriced
+}
+
+// 统计文件位置：$DSH_HOME（与 DSH 其余用户数据一致），未设置时退到 ~/.dsh。
+// 注意 Windows 上必须用 os.homedir()（HOME 往往为空，早先写成 `HOME || ''` 会让路径
+// 变成驱动器相对的 `\.dsh\...`，统计被写到当前盘根目录），这里同时保留旧位置作为迁移来源。
+const DATA_FILENAME = 'dsh-balance-and-cost.json'
+export const DSH_HOME_DIR = (process.env.DSH_HOME || '').trim() || join(homedir(), '.dsh')
+// 显式覆盖（自定义位置 / 测试用）：给出后不再探测旧位置
+const EXPLICIT_DATA_FILE = (process.env.DSH_BALANCE_AND_COST_FILE || '').trim()
+const DATA_FILE = EXPLICIT_DATA_FILE || join(DSH_HOME_DIR, DATA_FILENAME)
+// 旧版本可能落在这些位置（按优先级）：
+//  1) $HOME/.dsh/  —— 旧代码在 HOME 有值时的落点
+//  2) cwd 所在盘根的 \.dsh\ —— 旧代码在 HOME 为空时写出的驱动器相对路径（Windows）
+// 另可用 DSH_BALANCE_AND_COST_LEGACY_FILES 显式指定（多路径分隔符 ; / :，测试与手工迁移用）。
+const ENV_LEGACY_FILES = (process.env.DSH_BALANCE_AND_COST_LEGACY_FILES || '').trim()
+export const LEGACY_DATA_FILES = ENV_LEGACY_FILES
+  ? ENV_LEGACY_FILES.split(process.platform === 'win32' ? ';' : ':').map((p) => p.trim()).filter((p) => p.length > 0)
+  : (EXPLICIT_DATA_FILE
+    ? []
+    : [
+      process.env.HOME ? join(process.env.HOME, '.dsh', DATA_FILENAME) : null,
+      resolve('/.dsh/' + DATA_FILENAME),
+    ].filter((p) => p !== null && p !== DATA_FILE))
+
+// 读取一个统计文件（含 mtime，用于判断新旧分片是否互补）
+function readOneStatsFile(path) {
+  if (!existsSync(path)) return null
+  try {
+    const raw = JSON.parse(readFileSync(path, 'utf8'))
+    if (!raw || typeof raw !== 'object') return null
+    let mtimeMs = 0
+    try {
+      mtimeMs = statSync(path).mtimeMs
+    } catch {
+      mtimeMs = 0
+    }
+    return { path, raw, mtimeMs }
+  } catch {
+    return null
+  }
+}
+
+// 旧版本在 HOME 为空时会把统计写到「当前盘根」的 \.dsh\，换一次启动目录就会换一个盘，
+// 因此迁移时额外扫描各盘符（仅 Windows，且只在需要迁移时用到）。
+function driveRootLegacyFiles() {
+  if (process.platform !== 'win32') return []
+  const found = []
+  for (let code = 65; code <= 90; code++) {
+    const root = String.fromCharCode(code) + ':'
+    if (!existsSync(root + '\\')) continue
+    const path = root + '\\.dsh\\' + DATA_FILENAME
+    if (existsSync(path)) found.push(path)
+  }
+  return found
+}
+
+// 迁移扫描：新位置优先，其后是已知旧位置与各盘根旧位置（去重）
+export function candidateStatsPaths() {
+  const list = [DATA_FILE, ...LEGACY_DATA_FILES]
+  if (!existsSync(DATA_FILE) && ENV_LEGACY_FILES === '' && EXPLICIT_DATA_FILE === '') {
+    for (const path of driveRootLegacyFiles()) if (!list.includes(path)) list.push(path)
+  }
+  return list
+}
+
+// 读取第一个存在的统计文件（新位置优先）
+function readStatsFile() {
+  for (const path of candidateStatsPaths()) {
+    const found = readOneStatsFile(path)
+    if (found !== null) return found
+  }
+  return null
+}
+
+// 判定旧文件是不是「同一份数据的副本」：它的每个会话都已在主文件里、且调用次数完全一致。
+// 不同进程写出的分片即使会话 id 相同，各进程也只统计自己发起的调用，次数不会雷同，
+// 因此该判定只拦真正的文件副本，互补分片照常合并。
+export function isDuplicateShard(primarySessions, otherSessions) {
+  const ids = Object.keys(otherSessions || {})
+  if (ids.length === 0) return false
+  for (const id of ids) {
+    const mine = primarySessions[id]
+    if (mine === undefined) return false
+    if ((mine.calls || 0) !== (otherSessions[id].calls || 0)) return false
+  }
+  return true
+}
+
+// 哪些旧文件需要合并进主文件（排除主文件自身与完全重复的副本）
+export function planLegacyMerge(primary, others) {
+  const primarySessions = primary.sessions || {}
+  return others.filter((other) => other.path !== primary.path && !isDuplicateShard(primarySessions, other.sessions))
+}
+
+function mergeLedgerInto(dst, src) {
+  if (!src) return
+  for (const key of Object.keys(src.buckets || {})) {
+    const from = src.buckets[key]
+    const to = dst.buckets[key]
+    if (!to) {
+      dst.buckets[key] = from
+      continue
+    }
+    for (const model of Object.keys(from.models || {})) {
+      const a = to.models[model]
+      const b = from.models[model]
+      if (!a) {
+        to.models[model] = b
+        continue
+      }
+      a.calls += b.calls || 0
+      a.missTokens += b.missTokens || 0
+      a.hitTokens += b.hitTokens || 0
+      a.outputTokens += b.outputTokens || 0
+      a.missCostCny += b.missCostCny || 0
+      a.hitCostCny += b.hitCostCny || 0
+      a.outputCostCny += b.outputCostCny || 0
+    }
+  }
+  for (const model of Object.keys(src.settled || {})) {
+    const from = src.settled[model]
+    const to = dst.settled[model]
+    if (!to) {
+      dst.settled[model] = from
+      continue
+    }
+    to.calls += from.calls || 0
+    to.missTokens += from.missTokens || 0
+    to.hitTokens += from.hitTokens || 0
+    to.outputTokens += from.outputTokens || 0
+    to.missCostCny += from.missCostCny || 0
+    to.hitCostCny += from.hitCostCny || 0
+    to.outputCostCny += from.outputCostCny || 0
+    to.hours += from.hours || 0
+    to.firstAt = Math.min(to.firstAt || from.firstAt || 0, from.firstAt || to.firstAt || 0)
+    to.lastAt = Math.max(to.lastAt || 0, from.lastAt || 0)
+  }
+  dst.costCny = (dst.costCny || 0) + (src.costCny || 0)
+  dst.tokens = (dst.tokens || 0) + (src.tokens || 0)
+  dst.v = Math.min(typeof dst.v === 'number' ? dst.v : 0, typeof src.v === 'number' ? src.v : 0)
+}
+
+const SUM_FIELDS = ['calls', 'inputTokens', 'outputTokens', 'cacheReadTokens', 'cacheWriteTokens', 'reasoningTokens', 'costCny']
+
+// 合并两份互补的统计（分片）：计数相加、会话并集、计价缓存按整点相加
+export function mergeStats(target, extra) {
+  target.startedAt = Math.min(target.startedAt, extra.startedAt)
+  if (!target.baseline && extra.baseline) target.baseline = extra.baseline
+  for (const field of SUM_FIELDS) target.totals[field] = (target.totals[field] || 0) + (extra.totals[field] || 0)
+  target.totals.anyEstimated = !!target.totals.anyEstimated || !!extra.totals.anyEstimated
+  for (const key of Object.keys(extra.totals.perModel || {})) {
+    const from = extra.totals.perModel[key]
+    const to = target.totals.perModel[key]
+    if (!to) {
+      target.totals.perModel[key] = from
+      continue
+    }
+    for (const field of ['calls', 'inputTokens', 'outputTokens', 'cacheReadTokens', 'cacheWriteTokens', 'costCny']) {
+      to[field] = (to[field] || 0) + (from[field] || 0)
+    }
+    to.estimated = !!to.estimated || !!from.estimated
+  }
+  for (const sid of Object.keys(extra.sessions || {})) {
+    const from = extra.sessions[sid]
+    const to = target.sessions[sid]
+    if (!to) {
+      target.sessions[sid] = from
+      continue
+    }
+    for (const field of SUM_FIELDS) to[field] = (to[field] || 0) + (from[field] || 0)
+    for (const model of Object.keys(from.models || {})) to.models[model] = (to.models[model] || 0) + (from.models[model] || 0)
+    for (const model of Object.keys(from.modelsTok || {})) {
+      const src = from.modelsTok[model]
+      let dst = to.modelsTok[model]
+      if (!dst) {
+        dst = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, costCny: 0 }
+        to.modelsTok[model] = dst
+      }
+      for (const field of ['inputTokens', 'outputTokens', 'cacheReadTokens', 'cacheWriteTokens', 'costCny']) {
+        dst[field] = (dst[field] || 0) + (src[field] || 0)
+      }
+    }
+    mergeLedgerInto(to.ledger, from.ledger)
+  }
+  mergeLedgerInto(target.ledger, extra.ledger)
+  return target
+}
+
 const BALANCE_CACHE_MS = 60000
 const SAVE_DEBOUNCE_MS = 10000
 
@@ -332,26 +642,48 @@ export function reviveLedger(raw) {
   for (const name of Object.keys(raw.settled || {})) ledger.settled[name] = raw.settled[name]
   ledger.costCny = typeof raw.costCny === 'number' ? raw.costCny : 0
   ledger.tokens = typeof raw.tokens === 'number' ? raw.tokens : 0
+  // 保留落盘的价格表版本：缺失但存在分桶时视为「未知旧表」(0)，以便触发换表重算
+  ledger.v = typeof raw.v === 'number'
+    ? raw.v
+    : (Object.keys(raw.buckets || {}).length > 0 ? 0 : LEDGER_VERSION)
   return ledger
+}
+
+// 把某个文件解析成运行期 stats 结构
+function statsFromRaw(raw, path) {
+  const stats = {
+    startedAt: typeof raw.startedAt === 'number' ? raw.startedAt : Date.now(),
+    totals: { ...emptyTotals(), ...(raw.totals || {}) },
+    sessions: {},
+    baseline: raw.baseline || null,
+    ledger: reviveLedger(raw.ledger),
+    loadedFrom: path,
+  }
+  for (const key of Object.keys(raw.sessions || {})) {
+    const session = { ...emptySession(), ...raw.sessions[key] }
+    session.ledger = reviveLedger(raw.sessions[key] && raw.sessions[key].ledger)
+    stats.sessions[key] = session
+  }
+  return stats
 }
 
 function loadStats() {
   try {
-    if (!existsSync(DATA_FILE)) return null
-    const raw = JSON.parse(readFileSync(DATA_FILE, 'utf8'))
-    if (!raw || typeof raw !== 'object') return null
-    const stats = {
-      startedAt: typeof raw.startedAt === 'number' ? raw.startedAt : Date.now(),
-      totals: { ...emptyTotals(), ...(raw.totals || {}) },
-      sessions: {},
-      baseline: raw.baseline || null,
-      ledger: reviveLedger(raw.ledger),
-    }
-    for (const key of Object.keys(raw.sessions || {})) {
-      const session = { ...emptySession(), ...raw.sessions[key] }
-      session.ledger = reviveLedger(raw.sessions[key] && raw.sessions[key].ledger)
-      stats.sessions[key] = session
-    }
+    const primary = readStatsFile()
+    if (primary === null) return null
+    const stats = statsFromRaw(primary.raw, primary.path)
+    // 旧位置可能留下互补的分片（例如换启动目录后写到另一个盘根，或多个实例各写一份）：
+    // 副本忽略、其余合并，避免重复计数。
+    const others = candidateStatsPaths()
+      .map((path) => {
+        const found = readOneStatsFile(path)
+        if (found === null) return null
+        return { path: found.path, raw: found.raw, sessions: found.raw.sessions || {} }
+      })
+      .filter((item) => item !== null)
+    const merged = planLegacyMerge({ path: primary.path, sessions: stats.sessions }, others)
+    for (const item of merged) mergeStats(stats, statsFromRaw(item.raw, item.path))
+    stats.mergedFrom = merged.map((item) => item.path)
     return stats
   } catch {
     return null
@@ -489,24 +821,34 @@ function totalsBreakdown(stats, date) {
   const rawSum = missC + hitC + outC
   const target = stats.totals.costCny || 0
   const k = rawSum > 0 ? target / rawSum : 0
+  // 是否含「无时间记录」的历史 token：按全局比较缓存覆盖量，避免同一模型族被新旧两条
+  // perModel 行分摊时把旧 token 误判为已覆盖（费用合计不受影响，只影响这个标注）。
+  const ledAll = ledgerTotals(stats.ledger, null)
+  const ledTokens = ledAll.missTokens + ledAll.hitTokens + ledAll.outputTokens
+  const tokenTotal = miss + hit + out
   return {
     missTokens: miss,
     hitTokens: hit,
     outputTokens: out,
-    totalTokens: miss + hit + out,
+    totalTokens: tokenTotal,
     missCostCny: missC * k,
     hitCostCny: hitC * k,
     outputCostCny: outC * k,
     totalCostCny: rawSum * k,
     frozenCostCny: frozen * k,
-    residueTokens: residue,
-    approximate,
+    residueTokens: Math.max(residue, tokenTotal - ledTokens),
+    approximate: approximate || tokenTotal > ledTokens,
   }
 }
 
 export function apply(ctx) {
   const stats = loadStats() || { startedAt: Date.now(), totals: emptyTotals(), sessions: {}, baseline: null, ledger: emptyLedger() }
   if (!stats.ledger) stats.ledger = emptyLedger()
+  // 价格表版本变化 → 按各分桶记录的时间用新表重算一次（时间不变，只换表）
+  const repriced = repriceLedger(stats)
+  // 统计文件迁移到 $DSH_HOME（旧位置见 LEGACY_DATA_FILES），分片互补时已合并
+  const migrated = stats.loadedFrom !== undefined && stats.loadedFrom !== DATA_FILE
+  if (repriced || migrated) saveStats(stats)
   let saveTimer = null
   const scheduleSave = () => {
     if (saveTimer !== null) return
@@ -824,6 +1166,16 @@ export function apply(ctx) {
     const pricing = ledgerView(stats.ledger, null)
     pricing.currentSession = sid ? ledgerView(currentRow.ledger, null) : null
     pricing.maxBuckets = LEDGER_MAX_BUCKETS
+    // 当前生效的官方价格表信息（供界面标注与审计）
+    pricing.table = {
+      ...PRICING_INFO,
+      models: Object.keys(PRICES).map((key) => ({
+        model: key,
+        inputMiss: PRICES[key].inputMiss,
+        inputHit: PRICES[key].inputHit,
+        output: PRICES[key].output,
+      })),
+    }
     return {
       startedAt: stats.startedAt,
       totals,
@@ -924,5 +1276,6 @@ export function apply(ctx) {
     }
   })
 
-  console.log('[dsh-balance-and-cost] 已激活：llm/stream 统计 + 余额/用量路由')
+  console.log('[dsh-balance-and-cost] 已激活：llm/stream 统计 + 余额/用量路由；统计文件 ' + DATA_FILE
+    + (migrated ? '（已从 ' + stats.loadedFrom + ' 迁移' + ((stats.mergedFrom && stats.mergedFrom.length) ? '，并合并 ' + stats.mergedFrom.join('、') : '') + '）' : ''))
 }

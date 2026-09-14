@@ -187,10 +187,10 @@ if (typeof window !== 'undefined' && typeof window.__ModuleLoader__ !== 'undefin
               usageCard.push(React.createElement('div', { className: 'dsbal-sub', key: 'c' },
                 '估算费用（CNY）：',
                 React.createElement('span', { className: 'dsbal-warn' }, fmtCost(tot.costCny)),
-                tot.anyEstimated ? '（含未收录模型，按 deepseek-v4-flash 估算）' : ''))
+                tot.anyEstimated ? '（含未收录模型，按 deepseek-flash 估算）' : ''))
               usageCard.push(React.createElement('div', { className: 'dsbal-sub', key: 'p' },
                 '当前时段：',
-                React.createElement('span', { className: usage.peak ? 'dsbal-warn' : 'dsbal-ok' }, usage.peak ? '高峰（北京 9-12 / 14-18）' : '空闲'),
+                React.createElement('span', { className: usage.peak ? 'dsbal-warn' : 'dsbal-ok' }, usage.peak ? '高峰（工作日北京 9-12 / 14-18）' : '空闲'),
                 '；历史花费按消耗发生时刻的时段计价并已冻结，不随当前时段变化'))
               usageCard.push(React.createElement('div', { className: 'dsbal-sub', key: 'd' },
                 delta === null
@@ -199,11 +199,19 @@ if (typeof window !== 'undefined' && typeof window.__ModuleLoader__ !== 'undefin
               usageCard.push(React.createElement('div', { className: 'dsbal-note', key: 's' }, '统计持久化于 ' + fmtTime(usage.startedAt) + ' 起；余额基线 = 首次成功查询时的余额。当前会话的实时消耗见主页输入框下方的摘要条。'))
               if (usage.pricing) {
                 const pr = usage.pricing
+                const table = pr.table
                 usageCard.push(React.createElement('div', { className: 'dsbal-title', key: 'kt' }, '计价缓存（按小时）'))
                 usageCard.push(React.createElement('div', { className: 'dsbal-note', key: 'kn' },
                   '每次消耗都记录发生时间（北京整点）与当时单价，费用按记录冻结；共 ' + fmtNum(pr.hours) + ' 个整点，'
                   + '高峰 ' + fmtCompact(pr.peakTokens) + ' tok / 空闲 ' + fmtCompact(pr.offTokens) + ' tok，缓存合计 ≈' + fmtCost(pr.costCny)
                   + '（与上方估算费用一致）。'))
+                if (table) {
+                  usageCard.push(React.createElement('div', { className: 'dsbal-note', key: 'tb' },
+                    '价格表 v' + table.version + '（' + String(table.effectiveAt).slice(0, 10) + ' 生效，' + table.peakRule + '）：'
+                    + (table.models || []).map((m) => m.model + ' 未命中 ¥' + m.inputMiss.off + '/' + m.inputMiss.peak
+                      + ' · 命中 ¥' + m.inputHit.off + '/' + m.inputHit.peak
+                      + ' · 输出 ¥' + m.output.off + '/' + m.output.peak + '（空闲/高峰，元每百万 tok）').join('；')))
+                }
                 const hourRows = []
                 for (const h of (pr.settled || [])) {
                   hourRows.push(React.createElement('div', { className: 'dsbal-hour', key: 's-' + h.model },
@@ -315,7 +323,7 @@ if (typeof window !== 'undefined' && typeof window.__ModuleLoader__ !== 'undefin
                 React.createElement('button', { className: 'dsbal-btn', onClick: exportCsv }, '导出明细'),
                 React.createElement('button', { className: 'dsbal-btn', onClick: resetStats }, '重置记录'),
                 error ? React.createElement('span', { className: 'dsbal-bad' }, '刷新出错：' + error) : null),
-              React.createElement('div', { className: 'dsbal-note' }, '每 15 秒自动刷新（余额查询 Host 端缓存 60 秒）。费用按官方价格表分高峰/空闲计价，且以「消耗发生时刻」的单价写入计价缓存后冻结——高峰/空闲切换只会影响之后的新消耗，不会改变历史花费。'))
+              React.createElement('div', { className: 'dsbal-note' }, '每 15 秒自动刷新（余额查询 Host 端缓存 60 秒）。费用按官方最新价格表分高峰/空闲计价（高峰 = 工作日北京时间 9-12 / 14-18），并以「消耗发生时刻」的单价写入计价缓存后冻结——高峰/空闲切换只会影响之后的新消耗，不会改变历史花费。'))
           }
 
           function Summary(props) {
