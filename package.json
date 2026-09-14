@@ -1,6 +1,6 @@
 {
   "name": "dsh-balance-and-cost",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "DeepSeek 账户余额与模型消耗量：计价缓存按消耗发生的具体时间与当时单价冻结花费，价格表同步官方最新（deepseek-flash / deepseek-v4-pro，工作日高峰）；按模型与会话统计，主页摘要条 + 插件中心面板。",
   "private": true,
   "type": "module",

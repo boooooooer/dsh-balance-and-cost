@@ -52,13 +52,19 @@ const slots = {
     return () => {}
   },
 }
+// 关键回归：客户端插件必须通过 `inject: ['slots']` + ctx.slots 拿到槽位服务。
+// 这里刻意让 ctx.get 返回 undefined（模拟 DSH 0.1.5 下未声明服务取不到），
+// 插件仍必须完成两个槽位注册。
 const ctx = {
-  get: (name) => (name === 'slots' ? slots : undefined),
+  slots,
+  get: () => undefined,
   on: () => {},
   effect: () => {},
 }
 
 const plugin = descriptor.factory(requireFn)
+assert.deepEqual(plugin.inject, ['slots'], '客户端插件必须声明 inject: ["slots"]')
+assert.equal(typeof plugin.apply, 'function')
 plugin.apply(ctx)
 assert.equal(registered.length, 2, '应注册摘要条与设置页两个槽位')
 const panelReg = registered.find((r) => r.options.name === 'settings.plugins.tab')
@@ -151,11 +157,17 @@ assert.ok(panelText.includes('导出明细') && panelText.includes('重置记录
 
 // ── 摘要条：Summary 的 useState 顺序 = balance, usage, error ────────────────
 stateQueue = [balance, usage, null]
-const summaryText = textOf(summaryReg.component({ sessionId: 's1' }))
-assert.ok(summaryText.includes('DeepSeek'), '摘要条应渲染')
-assert.ok(summaryText.includes('88.50 CNY'), '摘要条应显示余额')
+const summaryEl = summaryReg.component({ sessionId: 's1' })
+const summaryText = textOf(summaryEl)
+assert.equal(summaryEl.props.className, 'dsbal-sum', '摘要条根节点使用 dsbal-sum（与系统 stats 行同款一行排版）')
+const flatKids = (kids) => kids.flatMap((kid) => (Array.isArray(kid) ? flatKids(kid) : [kid]))
+const summaryPills = flatKids(summaryEl.children).filter((child) => child && child.props && typeof child.props.className === 'string' && child.props.className.startsWith('dsbal-pill'))
+assert.equal(summaryPills.length, 4, '四个 pill：余额 / 本会话 / 总计 / 时段')
+assert.ok(summaryText.includes('DeepSeek 余额'), '摘要条应渲染余额')
+assert.ok(summaryText.includes('88.50 CNY'), '摘要条应显示余额数值')
 assert.ok(summaryText.includes('本会话'), '摘要条应显示本会话')
-assert.ok(summaryText.includes('[高峰]'), '摘要条应显示时段标记')
+assert.ok(summaryText.includes('高峰'), '摘要条应显示时段标记')
+assert.ok(!summaryText.includes('['), '时段标记不应再用方括号（对齐新版 UI）')
 
 // ── 无计价缓存的历史数据（旧落盘）：拆分标记为估算也不能崩 ────────────────────
 const legacyUsage = JSON.parse(JSON.stringify(usage))

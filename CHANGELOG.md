@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.3.1 (2026-09-14)
+
+### 修复
+
+- **底部摘要条与设置页在新版 UI 下整体消失**：DSH 0.1.5 起客户端插件必须用
+  `inject: ['slots']` 声明依赖的 cordis 服务，再通过 `ctx.slots` 访问；旧写法
+  `ctx.get('slots')` 在新版取不到（`apply` 提前 return，两个槽位都没挂载）。
+  已改为声明式注入；定时器改为可选探测（`ctx.get('timer')`，取不到就靠 SSE 刷新）。
+
+### 样式
+
+- 底部摘要条对齐系统自带 `stats` 行（`client-ui-chat` 的 StatsPills）：**单行、居中、不换行**，
+  同样的 pill 语言（24px 圆角、1px/8px 内边距、tertiary 文字、`tabular-nums`、悬停高亮）与
+  新版排版 token（`--dsh-content-font-size-secondary`、`--dsh-chat-content-width`、
+  `--dsh-composer-side-clearance`）；去掉方括号时段标记与分隔点，改为原生 pill 表达。
+
+### 测试
+
+- 前端渲染用例改为锁定新契约：即使 `ctx.get` 返回 undefined，插件也必须靠
+  `inject: ['slots']` + `ctx.slots` 完成两个槽位注册；并断言摘要条为一行 pill 结构。
+
 ## 0.3.0 (2026-09-14)
 
 ### 价格表同步官方最新（2026-09-10 12:00 生效）

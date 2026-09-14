@@ -7,6 +7,11 @@
  *   /__dsh-balance-and-cost/balance   → 余额快照
  *   /__dsh-balance-and-cost/usage     → 用量快照（?sessionId= 当前会话维度）
  * 每 15 秒轮询一次；余额由 Host 端 60 秒缓存兜底。
+ *
+ * 客户端插件契约（DSH 0.1.5 起）：返回的插件对象必须用 `inject` 声明依赖的 cordis
+ * 服务，再通过 `ctx.<service>` 访问；`ctx.get(...)` 对新版未声明的服务可能取不到
+ * （旧写法会让整段 apply 提前返回，槽位全部不挂载）。摘要条样式对齐系统自带
+ * `stats` 行（client-ui-chat 的 StatsPills）：同一套 flex + pill + 分隔符与排版 token。
  */
 if (typeof window !== 'undefined' && typeof window.__ModuleLoader__ !== 'undefined') {
   window.__ModuleLoader__.load({
@@ -22,6 +27,14 @@ if (typeof window !== 'undefined' && typeof window.__ModuleLoader__ !== 'undefin
       } catch {
         Tooltip = null
       }
+      // 可选服务：只对 inject 声明的服务保证可访问，其余用 ctx.get 探测（可能抛错 → 当作不可用）
+      const optionalService = (ctx, name) => {
+        try {
+          return typeof ctx.get === 'function' ? ctx.get(name) : undefined
+        } catch {
+          return undefined
+        }
+      }
       const API_BALANCE = '/__dsh-balance-and-cost/balance'
       const API_USAGE = '/__dsh-balance-and-cost/usage'
       const REFRESH_MS = 15000
@@ -33,9 +46,11 @@ if (typeof window !== 'undefined' && typeof window.__ModuleLoader__ !== 'undefin
       ).then((r) => r.json())
 
       return {
+        // 声明式注入：0.1.5 起客户端 ctx 只暴露已声明的服务
+        inject: ['slots'],
         apply(ctx) {
-          const slots = ctx.get('slots')
-          if (slots === undefined) return
+          const slots = ctx.slots !== undefined ? ctx.slots : optionalService(ctx, 'slots')
+          if (slots === undefined || slots === null) return
 
           const styleEl = document.createElement('style')
           styleEl.textContent = `
@@ -56,10 +71,13 @@ if (typeof window !== 'undefined' && typeof window.__ModuleLoader__ !== 'undefin
             .dsbal-btn { padding: 6px 14px; border-radius: 8px; border: 1px solid var(--dsw-alias-border-l2); background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-primary); cursor: pointer; font-size: 13px; }
             .dsbal-btn:hover { border-color: var(--dsw-alias-brand-primary); }
             .dsbal-btn:disabled { opacity: 0.6; cursor: default; }
-            .dsbal-sum { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 10px; font-size: 12px; color: var(--dsw-alias-label-secondary); line-height: 1.6; }
-            .dsbal-sum b { color: var(--dsw-alias-label-primary); font-weight: 600; font-variant-numeric: tabular-nums; }
-            .dsbal-sep { opacity: 0.45; }
-            .dsbal-models { cursor: help; border-bottom: 1px dotted var(--dsw-alias-border-l2); }
+            .dsbal-sum { display: flex; align-items: center; justify-content: center; flex-wrap: nowrap; gap: 12px; width: 100%; max-width: var(--dsh-chat-content-width); box-sizing: border-box; margin: 0 auto; padding: 4px calc(var(--dsh-composer-side-clearance) + 16px) 0; font-size: var(--dsh-content-font-size-secondary, 13px); line-height: calc(20px + var(--dsh-content-font-delta-secondary, 0px)); color: var(--dsw-alias-label-tertiary); white-space: nowrap; overflow: hidden; }
+            .dsbal-pill { box-sizing: border-box; max-width: 100%; display: inline-flex; align-items: center; padding: 1px 8px; border-radius: 24px; color: var(--dsw-alias-label-tertiary); font: inherit; font-variant-numeric: tabular-nums; white-space: nowrap; background: 0 0; border: none; }
+            .dsbal-pilltext { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-variant-numeric: tabular-nums; }
+            .dsbal-hover:hover { background: var(--dsw-alias-interactive-bg-hover); color: var(--dsw-alias-label-secondary); }
+            .dsbal-strong { color: var(--dsw-alias-label-secondary); font-weight: 500; }
+            .dsbal-sum .dsbal-sep { color: var(--dsw-alias-separator-primary); margin: 0 6px; font-variant-numeric: normal; }
+            .dsbal-models { cursor: help; }
             .dsbal-sess-list { display: flex; flex-direction: column; gap: 10px; margin-top: 10px; }
             .dsbal-sess { border: 1px solid var(--dsw-alias-border-l1); border-radius: 8px; padding: 8px 10px; background: var(--dsw-alias-bg-layer-2); }
             .dsbal-sess-title { font-size: 13px; font-weight: 600; color: var(--dsw-alias-label-primary); }
@@ -71,9 +89,12 @@ if (typeof window !== 'undefined' && typeof window.__ModuleLoader__ !== 'undefin
             .dsbal-tag { font-size: 11px; padding: 0 5px; border-radius: 4px; border: 1px solid var(--dsw-alias-border-l2); color: var(--dsw-alias-label-secondary); }
           `
           document.head.appendChild(styleEl)
-          ctx.on('dispose', () => {
+          const disposeStyles = () => {
             if (styleEl.parentNode) styleEl.parentNode.removeChild(styleEl)
-          })
+          }
+          // 与官方客户端模块一致用 ctx.effect 登记副作用；极旧/极简上下文没有 effect 时退回 dispose 事件
+          if (typeof ctx.effect === 'function') ctx.effect(() => disposeStyles)
+          else if (typeof ctx.on === 'function') ctx.on('dispose', disposeStyles)
 
           const fmtNum = (n) => (typeof n === 'number' && Number.isFinite(n) ? n.toLocaleString('zh-CN', { maximumFractionDigits: 2 }) : '—')
           const fmtCost = (n) => (typeof n === 'number' ? '¥ ' + n.toFixed(4) : '—')
@@ -118,7 +139,7 @@ if (typeof window !== 'undefined' && typeof window.__ModuleLoader__ !== 'undefin
             if (Tooltip !== null) return React.createElement(Tooltip, { label: detail, side: 'top', delayMs: 500 }, el)
             return React.cloneElement(el, { title: detail })
           }
-          const timer = ctx.get('timer')
+          const timer = optionalService(ctx, 'timer')
 
           const panelSeq = { v: 0 }
           const summarySeq = { v: 0 }
@@ -406,19 +427,22 @@ if (typeof window !== 'undefined' && typeof window.__ModuleLoader__ !== 'undefin
               }
             }
 
+            // 与系统自带 stats 行同一套排版：一行 pill（居中、不换行），不用分隔符
+            const pill = (key, opts) => React.createElement('span', {
+              key,
+              className: 'dsbal-pill' + (opts.hover ? ' dsbal-hover' : '') + (opts.tone ? ' ' + opts.tone : ''),
+            }, React.createElement('span', { className: 'dsbal-pilltext' }, opts.children))
+
             const nodes = [
-              React.createElement('span', { key: 'b' }, React.createElement('b', null, 'DeepSeek'), ' 余额 ', React.createElement('b', null, balText)),
-              React.createElement('span', { key: 'sep1', className: 'dsbal-sep' }, '·'),
-              React.createElement('span', { key: 'c' }, curNodes),
-              React.createElement('span', { key: 'sep2', className: 'dsbal-sep' }, '·'),
-              React.createElement('span', { key: 't' }, totNodes),
+              pill('b', { children: 'DeepSeek 余额 ' + balText }),
+              pill('c', { hover: true, children: curNodes }),
+              pill('t', { hover: true, children: totNodes }),
             ]
             if (usage) {
-              nodes.push(React.createElement('span', { key: 'sep3', className: 'dsbal-sep' }, '·'))
-              nodes.push(React.createElement('span', { key: 'pk', className: usage.peak ? 'dsbal-warn' : 'dsbal-ok' }, usage.peak ? '[高峰]' : '[空闲]'))
+              nodes.push(pill('pk', { tone: usage.peak ? 'dsbal-warn' : 'dsbal-ok', children: usage.peak ? '高峰' : '空闲' }))
             }
             if (error) {
-              nodes.push(React.createElement('span', { key: 'err', className: 'dsbal-bad' }, '（刷新失败）'))
+              nodes.push(pill('err', { tone: 'dsbal-bad', children: '刷新失败' }))
             }
             return React.createElement('div', { className: 'dsbal-sum' }, nodes)
           }

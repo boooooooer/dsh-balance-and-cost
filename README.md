@@ -2,7 +2,7 @@
 
 DeepSeek Harness（DSH）标准 bundle 插件：显示 **DeepSeek 账户余额** 与 **模型消耗量**。
 
-- 主页输入框下方实时摘要条：`DeepSeek 余额 ¥xx.xx CNY · 本会话（模型） xx.xM tok ≈¥x.xxx · 总计 xx.xM tok ≈¥x.xxx · [高峰/空闲]`（模型名跟随会话最近调用，token 按官方三档口径 M/K 缩略，悬停查看明细）
+- 主页输入框下方实时摘要条（与系统自带 `stats` 行同一套 pill 排版，单行居中、不换行）：`DeepSeek 余额 ¥xx.xx CNY · 本会话（模型） xx.xM tok ≈¥x.xxx · 总计 xx.xM tok ≈¥x.xxx · 高峰/空闲`（模型名跟随会话最近调用，token 按官方三档口径 M/K 缩略，悬停查看明细）
 - 插件中心（设置 → 插件）「DeepSeek 用量」标签页：余额明细、按模型/按会话统计、**计价缓存按小时明细**、三档悬停、导出 CSV、重置记录
 - 花费按**消耗发生时刻**的时段单价结算并写入计价缓存后冻结——高峰/空闲切换不会再让历史花费跳变；价格表同步到官方 2026-09-10 起的 V4.1-Flash 新价（模型改名与工作日高峰规则一并同步）
 
@@ -131,7 +131,7 @@ dsh-balance-and-cost/
 | 文件 | 职责 |
 |---|---|
 | `src/index.js` | `export const name` + `export function apply(ctx)`；`ctx.webServer.register` 暴露四个端点：`/balance`（余额，60s 缓存）、`/usage`（用量快照，含计价缓存视图，支持 `?sessionId=`）、`/events`（SSE 实时推送）、`/reset`（POST 清空统计） |
-| `src/client.js` | `window.__ModuleLoader__.load({ id, factory })` 注册浏览器插件；`slots` 注入「摘要条 + 设置页」两个位置，`fetch` 调用上述端点，`EventSource` 订阅 `/events` |
+| `src/client.js` | `window.__ModuleLoader__.load({ id, factory })` 注册浏览器插件；`inject: ['slots']` + `ctx.slots` 注入「摘要条 + 设置页」两个位置（DSH 0.1.5 起客户端插件必须声明依赖的 cordis 服务，`ctx.get(...)` 对未声明服务可能取不到），`fetch` 调用上述端点，`EventSource` 订阅 `/events` |
 
 费用在 Host 端按**消耗到达时刻**的时段单价结算并写入计价缓存（`ledger`）后冻结：
 摘要条与本会话/总计的三档拆分都是对缓存的求和，因此跨时段、跨天、重启后的历史花费都精确不变；
