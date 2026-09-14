@@ -802,7 +802,6 @@ function totalsBreakdown(stats, date) {
   let missC = 0
   let hitC = 0
   let outC = 0
-  let frozen = 0
   let residue = 0
   let approximate = false
   for (const key of Object.keys(stats.totals.perModel)) {
@@ -814,15 +813,15 @@ function totalsBreakdown(stats, date) {
     missC += b.missCostCny
     hitC += b.hitCostCny
     outC += b.outputCostCny
-    frozen += b.frozenCostCny
     residue += b.residueTokens
     if (b.approximate) approximate = true
   }
   const rawSum = missC + hitC + outC
   const target = stats.totals.costCny || 0
   const k = rawSum > 0 ? target / rawSum : 0
-  // 是否含「无时间记录」的历史 token：按全局比较缓存覆盖量，避免同一模型族被新旧两条
-  // perModel 行分摊时把旧 token 误判为已覆盖（费用合计不受影响，只影响这个标注）。
+  // 计价缓存部分统一取全局 ledger 口径：按 per-model 行累加会在同一模型族有多行
+  // （deepseek-v4-flash 旧名 + deepseek-flash 新名）时重复计数。
+  // 同时据此判断是否含「无时间记录」的历史 token。
   const ledAll = ledgerTotals(stats.ledger, null)
   const ledTokens = ledAll.missTokens + ledAll.hitTokens + ledAll.outputTokens
   const tokenTotal = miss + hit + out
@@ -835,7 +834,7 @@ function totalsBreakdown(stats, date) {
     hitCostCny: hitC * k,
     outputCostCny: outC * k,
     totalCostCny: rawSum * k,
-    frozenCostCny: frozen * k,
+    frozenCostCny: ledAll.totalCostCny,
     residueTokens: Math.max(residue, tokenTotal - ledTokens),
     approximate: approximate || tokenTotal > ledTokens,
   }
