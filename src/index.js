@@ -5,6 +5,10 @@
  * - 监听 llm/stream 瀑布流，累计 DeepSeek 路由的 token 消耗（输入/输出/缓存读取/
  *   缓存写入/推理），按官方价格表（api-docs.deepseek.com/zh-cn/quick_start/pricing）
  *   分高峰/空闲时段计价——价格按每次调用时刻的北京时间时段即时判定。
+ * - 计价缓存（cost ledger）：每次消耗都把「具体时间（北京整点）+ 当时单价 + 三档
+ *   token + 该单价下的真实花费」写入缓存并冻结。所有展示（三档悬停、总计、按会话、
+ *   按小时明细）都从这份记录读取，绝不用「当前时间」重算历史 token 的价格，
+ *   因此高峰/空闲切换时历史花费不会跳变。
  * - 按模型（provider:model）与按会话（sessionId）双维度聚合，区分「总计」与
  *   「当前会话」。
  * - 账户余额：经 credentials 服务解析 DEEPSEEK_API_KEY，用 Node 内置 fetch 调用
@@ -61,6 +65,244 @@ export function priceFor(model, date) {
   }
 }
 
+// 模型名归一化到价格表 key（带版本后缀如 deepseek-v4-flash-0731 → deepseek-v4-flash），
+// 未收录模型保留原始名。归一化后的名字同时作为统计与计价缓存的 key。
+export function normalizeModel(model) {
+  const m = String(model || 'unknown')
+  for (const key of Object.keys(PRICES)) {
+    if (m === key || m.startsWith(key + '-') || m.startsWith(key + '_')) return key
+  }
+  return m
+}
+
+// 存储 key 与查询名的前缀匹配（兼容历史 key 分裂：deepseek-v4-flash + deepseek-v4-flash-0731）
+export function prefixMatch(stored, wanted) {
+  const s = String(stored || '')
+  const w = String(wanted || '')
+  return s === w || s.startsWith(w + '-') || s.startsWith(w + '_')
+}
+
+// 模型名比对：两侧先归一到价格表 key 再前缀匹配。会话配置里的模型名可能带版本后缀
+// （deepseek-v4-flash-0731）而统计 key 已归一化，双向归一后才能在两个方向命中同族记录。
+export function modelMatches(stored, wanted) {
+  return prefixMatch(normalizeModel(stored), normalizeModel(wanted))
+}
+
+// ── 计价缓存（cost ledger）───────────────────────────────────────────────────
+// 设计要点：**历史花费一经记录即冻结**。
+// 每次实时消耗都会按「发生时刻」写入一个小时分桶（北京时间整点），桶内记录：
+//   at        该整点的 UTC 毫秒时间戳（真实时间点）
+//   peak      该时刻属于高峰还是空闲
+//   models.*  该模型在这个小时内的调用次数、三档 token、三档真实花费、当时单价快照
+// 之后的高峰/空闲切换、跨天、进程重启都不会改变已记录的费用——
+// 展示层只做「求和」，不再用当前时间给历史 token 重新定价。
+const LEDGER_VERSION = 1
+const BEIJING_OFFSET_MS = 8 * 60 * 60 * 1000
+const LEDGER_MAX_BUCKETS = 720 // 保留最近 720 个整点（30 天），更早的折叠进 settled
+const LEDGER_VIEW_MAX = 24 // 对外暴露的最近分桶行数
+
+// 北京时间整点的 UTC 毫秒（用于排序、裁剪与展示）
+export function beijingHourStart(date) {
+  return Math.floor((date.getTime() + BEIJING_OFFSET_MS) / 3600000) * 3600000 - BEIJING_OFFSET_MS
+}
+
+// 北京时间整点 key：'2026-09-14T09'（+08:00）
+export function beijingHourKey(date) {
+  const shifted = new Date(date.getTime() + BEIJING_OFFSET_MS)
+  const p = (n) => String(n).padStart(2, '0')
+  return shifted.getUTCFullYear() + '-' + p(shifted.getUTCMonth() + 1) + '-' + p(shifted.getUTCDate()) + 'T' + p(shifted.getUTCHours())
+}
+
+export function emptyLedger() {
+  return { v: LEDGER_VERSION, buckets: {}, settled: {}, costCny: 0, tokens: 0 }
+}
+
+// 分桶裁剪：超过保留窗口的最旧整点折叠进 settled（按模型汇总），
+// 只丢时间粒度、不丢费用——合计仍然精确。
+function pruneLedger(ledger) {
+  const keys = Object.keys(ledger.buckets)
+  if (keys.length <= LEDGER_MAX_BUCKETS) return
+  keys.sort((a, b) => ledger.buckets[a].at - ledger.buckets[b].at)
+  for (const key of keys.slice(0, keys.length - LEDGER_MAX_BUCKETS)) {
+    const bucket = ledger.buckets[key]
+    for (const model of Object.keys(bucket.models)) {
+      const row = bucket.models[model]
+      let s = ledger.settled[model]
+      if (!s) {
+        s = { calls: 0, missTokens: 0, hitTokens: 0, outputTokens: 0, missCostCny: 0, hitCostCny: 0, outputCostCny: 0, hours: 0, firstAt: bucket.at, lastAt: bucket.at }
+        ledger.settled[model] = s
+      }
+      s.calls += row.calls
+      s.missTokens += row.missTokens
+      s.hitTokens += row.hitTokens
+      s.outputTokens += row.outputTokens
+      s.missCostCny += row.missCostCny
+      s.hitCostCny += row.hitCostCny
+      s.outputCostCny += row.outputCostCny
+      s.hours += 1
+      s.firstAt = Math.min(s.firstAt, bucket.at)
+      s.lastAt = Math.max(s.lastAt, bucket.at)
+    }
+    delete ledger.buckets[key]
+  }
+}
+
+// 记录一次消耗：把「具体时间 + 当时单价」写进计价缓存，返回按该单价冻结的真实费用。
+// 费用用本次调用的实际单价计算（row.price 是该小时首次出现时的单价快照，供展示与审计）。
+export function ledgerAdd(ledger, model, date, tiers, price) {
+  if (!ledger || typeof ledger !== 'object') return 0
+  if (!ledger.buckets) ledger.buckets = {}
+  if (!ledger.settled) ledger.settled = {}
+  const miss = (tiers.inputTokens || 0) + (tiers.cacheWriteTokens || 0)
+  const hit = tiers.cacheReadTokens || 0
+  const out = tiers.outputTokens || 0
+  const missCost = miss * price.input / 1e6
+  const hitCost = hit * price.cacheRead / 1e6
+  const outCost = out * price.output / 1e6
+  const cost = missCost + hitCost + outCost
+  const key = beijingHourKey(date)
+  const at = beijingHourStart(date)
+  let bucket = ledger.buckets[key]
+  if (!bucket) {
+    bucket = { at, peak: !!price.peak, models: {} }
+    ledger.buckets[key] = bucket
+  }
+  let row = bucket.models[model]
+  if (!row) {
+    row = {
+      peak: !!price.peak,
+      estimated: !!price.estimated,
+      price: { input: price.input, cacheRead: price.cacheRead, cacheWrite: price.cacheWrite, output: price.output },
+      calls: 0, missTokens: 0, hitTokens: 0, outputTokens: 0,
+      missCostCny: 0, hitCostCny: 0, outputCostCny: 0,
+    }
+    bucket.models[model] = row
+  }
+  row.calls += 1
+  row.missTokens += miss
+  row.hitTokens += hit
+  row.outputTokens += out
+  row.missCostCny += missCost
+  row.hitCostCny += hitCost
+  row.outputCostCny += outCost
+  ledger.costCny = (ledger.costCny || 0) + cost
+  ledger.tokens = (ledger.tokens || 0) + miss + hit + out
+  pruneLedger(ledger)
+  return cost
+}
+
+// 从计价缓存读出某个模型（model 为空 = 全部模型）的冻结三档合计
+export function ledgerTotals(ledger, model) {
+  const out = {
+    calls: 0, missTokens: 0, hitTokens: 0, outputTokens: 0,
+    missCostCny: 0, hitCostCny: 0, outputCostCny: 0, totalCostCny: 0,
+    hours: 0, peakTokens: 0, offTokens: 0, firstAt: null, lastAt: null, estimated: false,
+  }
+  if (!ledger || typeof ledger !== 'object') return out
+  const wanted = model === null || model === undefined ? null : normalizeModel(model)
+  const add = (row, peak, at) => {
+    out.calls += row.calls || 0
+    out.missTokens += row.missTokens || 0
+    out.hitTokens += row.hitTokens || 0
+    out.outputTokens += row.outputTokens || 0
+    out.missCostCny += row.missCostCny || 0
+    out.hitCostCny += row.hitCostCny || 0
+    out.outputCostCny += row.outputCostCny || 0
+    if (row.estimated) out.estimated = true
+    const tok = (row.missTokens || 0) + (row.hitTokens || 0) + (row.outputTokens || 0)
+    if (peak) out.peakTokens += tok
+    else out.offTokens += tok
+    if (typeof at === 'number') {
+      out.hours += 1
+      out.firstAt = out.firstAt === null ? at : Math.min(out.firstAt, at)
+      out.lastAt = out.lastAt === null ? at : Math.max(out.lastAt, at)
+    }
+  }
+  for (const key of Object.keys(ledger.buckets || {})) {
+    const bucket = ledger.buckets[key]
+    for (const name of Object.keys(bucket.models || {})) {
+      if (wanted !== null && !modelMatches(name, wanted)) continue
+      add(bucket.models[name], bucket.peak, bucket.at)
+    }
+  }
+  for (const name of Object.keys(ledger.settled || {})) {
+    if (wanted !== null && !modelMatches(name, wanted)) continue
+    add(ledger.settled[name], false, null)
+  }
+  out.totalCostCny = out.missCostCny + out.hitCostCny + out.outputCostCny
+  return out
+}
+
+// 计价缓存的可视快照：最近 LEDGER_VIEW_MAX 个整点 + 折叠归档 + 合计
+export function ledgerView(ledger, model) {
+  const wanted = model === null || model === undefined ? null : normalizeModel(model)
+  const rows = []
+  for (const key of Object.keys((ledger && ledger.buckets) || {})) {
+    const bucket = ledger.buckets[key]
+    let calls = 0
+    let miss = 0
+    let hit = 0
+    let out = 0
+    let cost = 0
+    const models = []
+    const price = {}
+    for (const name of Object.keys(bucket.models || {})) {
+      if (wanted !== null && !modelMatches(name, wanted)) continue
+      const row = bucket.models[name]
+      calls += row.calls || 0
+      miss += row.missTokens || 0
+      hit += row.hitTokens || 0
+      out += row.outputTokens || 0
+      cost += (row.missCostCny || 0) + (row.hitCostCny || 0) + (row.outputCostCny || 0)
+      models.push(name)
+      price[name] = row.price
+    }
+    if (calls === 0) continue
+    rows.push({
+      hour: key,
+      at: bucket.at,
+      peak: !!bucket.peak,
+      calls,
+      missTokens: miss,
+      hitTokens: hit,
+      outputTokens: out,
+      tokens: miss + hit + out,
+      costCny: cost,
+      models,
+      price,
+    })
+  }
+  rows.sort((a, b) => b.at - a.at)
+  const settled = []
+  for (const name of Object.keys((ledger && ledger.settled) || {})) {
+    if (wanted !== null && !modelMatches(name, wanted)) continue
+    const s = ledger.settled[name]
+    settled.push({
+      model: name,
+      hours: s.hours || 0,
+      calls: s.calls || 0,
+      tokens: (s.missTokens || 0) + (s.hitTokens || 0) + (s.outputTokens || 0),
+      costCny: (s.missCostCny || 0) + (s.hitCostCny || 0) + (s.outputCostCny || 0),
+      firstAt: s.firstAt || null,
+      lastAt: s.lastAt || null,
+    })
+  }
+  settled.sort((a, b) => (b.lastAt || 0) - (a.lastAt || 0))
+  const totals = ledgerTotals(ledger, model)
+  return {
+    hours: rows.length,
+    shown: rows.slice(0, LEDGER_VIEW_MAX),
+    truncated: Math.max(0, rows.length - LEDGER_VIEW_MAX),
+    settled,
+    costCny: totals.totalCostCny,
+    tokens: totals.missTokens + totals.hitTokens + totals.outputTokens,
+    peakTokens: totals.peakTokens,
+    offTokens: totals.offTokens,
+    firstAt: totals.firstAt,
+    lastAt: totals.lastAt,
+  }
+}
+
 const DATA_FILE = join(process.env.DSH_HOME || (process.env.HOME || '') + '/.dsh', 'dsh-balance-and-cost.json')
 const BALANCE_CACHE_MS = 60000
 const SAVE_DEBOUNCE_MS = 10000
@@ -70,7 +312,27 @@ function emptyTotals() {
 }
 
 function emptySession() {
-  return { calls: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, costCny: 0, models: {}, modelsTok: {} }
+  return { calls: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, costCny: 0, models: {}, modelsTok: {}, ledger: emptyLedger() }
+}
+
+// 恢复计价缓存：缺少 buckets/settled 时补空结构（旧版本落盘没有 ledger，
+// 这部分历史 token 由 scopeBreakdown 用「已记录的真实费用残差」兜底分摊）
+export function reviveLedger(raw) {
+  const ledger = emptyLedger()
+  if (!raw || typeof raw !== 'object') return ledger
+  for (const key of Object.keys(raw.buckets || {})) {
+    const bucket = raw.buckets[key]
+    if (!bucket || typeof bucket !== 'object' || !bucket.models) continue
+    ledger.buckets[key] = {
+      at: typeof bucket.at === 'number' ? bucket.at : (Date.parse(key + ':00:00+08:00') || 0),
+      peak: !!bucket.peak,
+      models: bucket.models,
+    }
+  }
+  for (const name of Object.keys(raw.settled || {})) ledger.settled[name] = raw.settled[name]
+  ledger.costCny = typeof raw.costCny === 'number' ? raw.costCny : 0
+  ledger.tokens = typeof raw.tokens === 'number' ? raw.tokens : 0
+  return ledger
 }
 
 function loadStats() {
@@ -83,9 +345,12 @@ function loadStats() {
       totals: { ...emptyTotals(), ...(raw.totals || {}) },
       sessions: {},
       baseline: raw.baseline || null,
+      ledger: reviveLedger(raw.ledger),
     }
     for (const key of Object.keys(raw.sessions || {})) {
-      stats.sessions[key] = { ...emptySession(), ...raw.sessions[key] }
+      const session = { ...emptySession(), ...raw.sessions[key] }
+      session.ledger = reviveLedger(raw.sessions[key] && raw.sessions[key].ledger)
+      stats.sessions[key] = session
     }
     return stats
   } catch {
@@ -114,7 +379,8 @@ function sendJson(res, value, status = 200) {
 }
 
 // 三档用量拆分（与官方计费口径一致）：输入·缓存未命中（含缓存写入，官方按未命中价收）/
-// 输入·缓存命中 / 输出；费用按当前时段单价实时计算，三档费用之和 = 合计。
+// 输入·缓存命中 / 输出。**该函数用 date 时刻的单价计算，只用于兜底估算**——
+// 正式展示请用 scopeBreakdown（读计价缓存里冻结的真实费用）。
 export function usageBreakdown(row, model, date) {
   const p = priceFor(model, date)
   const miss = (row.inputTokens || 0) + (row.cacheWriteTokens || 0)
@@ -135,7 +401,68 @@ export function usageBreakdown(row, model, date) {
   }
 }
 
-// 全局总计的三档汇总：按每个模型各自的单价分别计算后相加
+export function tokensFromRow(row) {
+  const miss = (row.inputTokens || 0) + (row.cacheWriteTokens || 0)
+  const hit = row.cacheReadTokens || 0
+  const out = row.outputTokens || 0
+  return { miss, hit, out, total: miss + hit + out }
+}
+
+// 展示口径的三档拆分：
+// - 费用主体来自计价缓存（每次消耗发生时刻的单价，已冻结），因此时段切换不会改变历史花费；
+// - 旧版本落盘的历史 token 没有时间记录，用「已记录的真实总费用 − 缓存已计费用」作为残差，
+//   按当前单价权重分摊（仅是拆分近似，**合计始终等于记录的真实费用**），并标记 approximate。
+// date 只参与残差权重，不参与已记录部分——这就是「价格不再突变」的关键。
+export function scopeBreakdown(tokens, recordedCostCny, ledger, model, date) {
+  const led = ledgerTotals(ledger, model)
+  const residueMiss = Math.max(0, tokens.miss - led.missTokens)
+  const residueHit = Math.max(0, tokens.hit - led.hitTokens)
+  const residueOut = Math.max(0, tokens.out - led.outputTokens)
+  const residueTokens = residueMiss + residueHit + residueOut
+  let missCost = led.missCostCny
+  let hitCost = led.hitCostCny
+  let outCost = led.outputCostCny
+  if (residueTokens > 0) {
+    const p = priceFor(model || '', date)
+    const wMiss = residueMiss * p.input / 1e6
+    const wHit = residueHit * p.cacheRead / 1e6
+    const wOut = residueOut * p.output / 1e6
+    const wSum = wMiss + wHit + wOut
+    const residueCost = Math.max(0, (recordedCostCny || 0) - led.totalCostCny)
+    if (wSum > 0) {
+      const factor = residueCost / wSum
+      missCost += wMiss * factor
+      hitCost += wHit * factor
+      outCost += wOut * factor
+    } else if (residueCost > 0) {
+      missCost += residueCost
+    }
+  }
+  // 归一：合计必须等于记录的真实费用（三档之和 = 合计）
+  const rawSum = missCost + hitCost + outCost
+  const target = typeof recordedCostCny === 'number' && Number.isFinite(recordedCostCny) ? recordedCostCny : rawSum
+  const k = rawSum > 0 ? target / rawSum : 0
+  return {
+    missTokens: tokens.miss,
+    hitTokens: tokens.hit,
+    outputTokens: tokens.out,
+    totalTokens: tokens.total,
+    missCostCny: missCost * k,
+    hitCostCny: hitCost * k,
+    outputCostCny: outCost * k,
+    totalCostCny: rawSum * k,
+    // 计价缓存信息：frozen 部分是逐次消耗冻结的真实费用，approximate 表示含无时间记录的历史 token
+    frozenCostCny: led.totalCostCny,
+    residueTokens,
+    approximate: residueTokens > 0,
+    hours: led.hours,
+    peakTokens: led.peakTokens,
+    offTokens: led.offTokens,
+  }
+}
+
+// 全局总计的三档汇总：每个模型各自读自己的计价缓存（旧数据用各自单价分摊残差）后相加，
+// 再按 totals.costCny（逐次调用冻结的真实费用之和）归一。
 function totalsBreakdown(stats, date) {
   let miss = 0
   let hit = 0
@@ -143,30 +470,43 @@ function totalsBreakdown(stats, date) {
   let missC = 0
   let hitC = 0
   let outC = 0
+  let frozen = 0
+  let residue = 0
+  let approximate = false
   for (const key of Object.keys(stats.totals.perModel)) {
     const r = stats.totals.perModel[key]
-    const b = usageBreakdown(r, r.model, date)
+    const b = scopeBreakdown(tokensFromRow(r), r.costCny || 0, stats.ledger, r.model, date)
     miss += b.missTokens
     hit += b.hitTokens
     out += b.outputTokens
     missC += b.missCostCny
     hitC += b.hitCostCny
     outC += b.outputCostCny
+    frozen += b.frozenCostCny
+    residue += b.residueTokens
+    if (b.approximate) approximate = true
   }
+  const rawSum = missC + hitC + outC
+  const target = stats.totals.costCny || 0
+  const k = rawSum > 0 ? target / rawSum : 0
   return {
     missTokens: miss,
     hitTokens: hit,
     outputTokens: out,
     totalTokens: miss + hit + out,
-    missCostCny: missC,
-    hitCostCny: hitC,
-    outputCostCny: outC,
-    totalCostCny: missC + hitC + outC,
+    missCostCny: missC * k,
+    hitCostCny: hitC * k,
+    outputCostCny: outC * k,
+    totalCostCny: rawSum * k,
+    frozenCostCny: frozen * k,
+    residueTokens: residue,
+    approximate,
   }
 }
 
 export function apply(ctx) {
-  const stats = loadStats() || { startedAt: Date.now(), totals: emptyTotals(), sessions: {}, baseline: null }
+  const stats = loadStats() || { startedAt: Date.now(), totals: emptyTotals(), sessions: {}, baseline: null, ledger: emptyLedger() }
+  if (!stats.ledger) stats.ledger = emptyLedger()
   let saveTimer = null
   const scheduleSave = () => {
     if (saveTimer !== null) return
@@ -225,8 +565,12 @@ export function apply(ctx) {
           const cr = u.cacheReadTokens || 0
           const cw = u.cacheWriteTokens || 0
           const rt = u.reasoningTokens || 0
-          const price = priceFor(model, new Date())
-          const cost = (i * price.input + cr * price.cacheRead + cw * price.cacheWrite + o * price.output) / 1e6
+          // 计价缓存的写入时刻 = 消耗发生的具体时间：单价按这一刻判定并冻结，
+          // 返回的 cost 就是这次消耗的真实花费（之后任何时段变化都不会改动它）
+          const at = new Date()
+          const price = priceFor(model, at)
+          const normModel = normalizeModel(model)
+          const cost = ledgerAdd(stats.ledger, normModel, at, { inputTokens: i, outputTokens: o, cacheReadTokens: cr, cacheWriteTokens: cw }, price)
           stats.totals.calls += 1
           stats.totals.inputTokens += i
           stats.totals.outputTokens += o
@@ -260,9 +604,10 @@ export function apply(ctx) {
             s.cacheWriteTokens += cw
             s.reasoningTokens += rt
             s.costCny += cost
+            // 会话级计价缓存：同一份「时间 + 单价」记录，供本会话三档悬停读取
+            ledgerAdd(s.ledger, normModel, at, { inputTokens: i, outputTokens: o, cacheReadTokens: cr, cacheWriteTokens: cw }, price)
             // 模型名归一化到价格表 key（带版本后缀如 deepseek-v4-flash-0731 → deepseek-v4-flash），
             // 保证 models/modelsTok 的 key 与价格表、悬停查询一致；未收录模型保留原始名
-            const normModel = resolvePriceTable(model) !== undefined ? Object.keys(PRICES).find((k) => model === k || model.startsWith(k + '-') || model.startsWith(k + '_')) : model
             s.models[normModel] = (s.models[normModel] || 0) + 1
             // 按模型细分 token（供「当前模型实际消耗」与悬停两模型对比）
             let mt = s.modelsTok[normModel]
@@ -370,10 +715,10 @@ export function apply(ctx) {
         let tokens = 0
         let costCny = 0
         for (const k of Object.keys(s.models)) {
-          if (k === m || k.startsWith(m + '-') || k.startsWith(m + '_')) calls += s.models[k] || 0
+          if (modelMatches(k, m)) calls += s.models[k] || 0
         }
         for (const k of Object.keys(s.modelsTok || {})) {
-          if (k === m || k.startsWith(m + '-') || k.startsWith(m + '_')) {
+          if (modelMatches(k, m)) {
             const t = s.modelsTok[k]
             tokens += (t.inputTokens || 0) + (t.outputTokens || 0) + (t.cacheReadTokens || 0) + (t.cacheWriteTokens || 0)
             costCny += t.costCny || 0
@@ -435,7 +780,7 @@ export function apply(ctx) {
       let tokens = 0
       let costCny = 0
       for (const k of Object.keys(currentRow.modelsTok || {})) {
-        if (k === m || k.startsWith(m + '-') || k.startsWith(m + '_')) {
+        if (modelMatches(k, m)) {
           const t = currentRow.modelsTok[k]
           tokens += (t.inputTokens || 0) + (t.outputTokens || 0) + (t.cacheReadTokens || 0) + (t.cacheWriteTokens || 0)
           costCny += t.costCny || 0
@@ -455,11 +800,13 @@ export function apply(ctx) {
       })
     // 当前选中模型的实际消耗（本会话格直接显示）
     current.selectedActual = selectedModel ? modelTokens(selectedModel.model) : { tokens: 0, costCny: 0 }
-    // 实时三档拆分（摘要条悬停用）：当前选中模型 + 全局总计，口径统一、三档之和 = 合计
-    const rawModelRow = (m) => {
+    const now = new Date()
+    // 三档拆分全部读计价缓存（消耗发生时刻的单价，已冻结）：
+    // 已记录部分永不随当前时段变化，因此高峰/空闲切换不会造成历史花费跳变。
+    const modelTokensRow = (m) => {
       const row = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 }
       for (const k of Object.keys(currentRow.modelsTok || {})) {
-        if (k === m || k.startsWith(m + '-') || k.startsWith(m + '_')) {
+        if (modelMatches(k, m)) {
           const t = currentRow.modelsTok[k]
           row.inputTokens += t.inputTokens || 0
           row.outputTokens += t.outputTokens || 0
@@ -469,11 +816,14 @@ export function apply(ctx) {
       }
       return row
     }
-    const now = new Date()
     current.selectedBreakdown = selectedModel
-      ? usageBreakdown(rawModelRow(selectedModel.model), selectedModel.model, now)
+      ? scopeBreakdown(tokensFromRow(modelTokensRow(selectedModel.model)), modelTokens(selectedModel.model).costCny, currentRow.ledger, selectedModel.model, now)
       : null
     totals.breakdown = totalsBreakdown(stats, now)
+    // 计价缓存视图（设置页「计价缓存（按小时）」用）：记录每次消耗的具体时间与当时单价
+    const pricing = ledgerView(stats.ledger, null)
+    pricing.currentSession = sid ? ledgerView(currentRow.ledger, null) : null
+    pricing.maxBuckets = LEDGER_MAX_BUCKETS
     return {
       startedAt: stats.startedAt,
       totals,
@@ -482,6 +832,7 @@ export function apply(ctx) {
       sessions,
       peak: isPeak(new Date()),
       selectedModel,
+      pricing,
     }
   }
 
@@ -526,6 +877,7 @@ export function apply(ctx) {
         stats.sessions = {}
         stats.baseline = null
         stats.startedAt = Date.now()
+        stats.ledger = emptyLedger()
         balanceCache = { at: 0, value: null }
         saveStats(stats)
         sseBroadcast({ type: 'usage' })

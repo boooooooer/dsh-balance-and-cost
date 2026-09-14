@@ -13,7 +13,8 @@ if (typeof window !== 'undefined' && typeof window.__ModuleLoader__ !== 'undefin
     id: 'dsh-balance-and-cost',
     factory(require) {
       const React = require('react')
-      // 复用 DSH 的 Tooltip（与默认 stats 行同款）；该内部包不在 boot graph 时优雅回退
+      // 复用 DSH 的 Tooltip（与默认 stats 行同款）。DSH 0.1.5 起该包不再作为独立依赖，
+      // 但模块 id 仍由 web 前端模块注册表提供；任何情况下取不到都优雅回退原生 title。
       let Tooltip = null
       try {
         const primitives = require('@deepseek-ai/dsh-client-ui-primitives')
@@ -64,6 +65,10 @@ if (typeof window !== 'undefined' && typeof window.__ModuleLoader__ !== 'undefin
             .dsbal-sess-title { font-size: 13px; font-weight: 600; color: var(--dsw-alias-label-primary); }
             .dsbal-sess-model { font-size: 12px; color: var(--dsw-alias-label-secondary); margin-left: 10px; }
             .dsbal-sess-stats { font-size: 12px; color: var(--dsw-alias-label-secondary); margin-top: 4px; }
+            .dsbal-hours { display: flex; flex-direction: column; gap: 3px; margin-top: 8px; }
+            .dsbal-hour { display: flex; align-items: baseline; gap: 8px; font-size: 12px; color: var(--dsw-alias-label-primary); font-variant-numeric: tabular-nums; }
+            .dsbal-hour-time { color: var(--dsw-alias-label-secondary); min-width: 132px; }
+            .dsbal-tag { font-size: 11px; padding: 0 5px; border-radius: 4px; border: 1px solid var(--dsw-alias-border-l2); color: var(--dsw-alias-label-secondary); }
           `
           document.head.appendChild(styleEl)
           ctx.on('dispose', () => {
@@ -86,12 +91,32 @@ if (typeof window !== 'undefined' && typeof window.__ModuleLoader__ !== 'undefin
             return String(Math.round(n))
           }
           // 三档明细（悬停用，与官方计费口径一致；三档之和 = 合计）
+          // 费用来自 Host 端计价缓存：按每次消耗发生时刻的单价冻结，不随当前时段变化。
           const fmtBreakdown = (bd) => {
             if (!bd) return ''
             return '输入·缓存未命中：' + fmtNum(bd.missTokens) + ' tok ≈' + fmtCost(bd.missCostCny)
               + '\n输入·缓存命中：' + fmtNum(bd.hitTokens) + ' tok ≈' + fmtCost(bd.hitCostCny)
               + '\n输出：' + fmtNum(bd.outputTokens) + ' tok ≈' + fmtCost(bd.outputCostCny)
               + '\n合计：' + fmtNum(bd.totalTokens) + ' tok ≈' + fmtCost(bd.totalCostCny)
+              + '\n（按消耗发生时刻的时段计价）'
+              + (bd.approximate ? '\n（含无时间记录的历史 token，拆分按估算）' : '')
+          }
+          // 北京时间整点 key → '09-14 09:00–10:00'
+          const fmtHour = (key) => {
+            const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2})$/.exec(String(key || ''))
+            if (!m) return String(key || '—')
+            const h = Number(m[4])
+            return m[2] + '-' + m[3] + ' ' + String(h).padStart(2, '0') + ':00–' + String((h + 1) % 24).padStart(2, '0') + ':00'
+          }
+          // 单价快照文本（审计用）
+          const fmtPrice = (p) => (p
+            ? '未命中 ¥' + p.input + '/M · 命中 ¥' + p.cacheRead + '/M · 输出 ¥' + p.output + '/M（含缓存写入按未命中计）'
+            : '')
+          // 悬停明细：优先用 DSH Tooltip，取不到时回退原生 title
+          const withDetail = (el, detail) => {
+            if (!detail) return el
+            if (Tooltip !== null) return React.createElement(Tooltip, { label: detail, side: 'top', delayMs: 500 }, el)
+            return React.cloneElement(el, { title: detail })
           }
           const timer = ctx.get('timer')
 
@@ -166,12 +191,45 @@ if (typeof window !== 'undefined' && typeof window.__ModuleLoader__ !== 'undefin
               usageCard.push(React.createElement('div', { className: 'dsbal-sub', key: 'p' },
                 '当前时段：',
                 React.createElement('span', { className: usage.peak ? 'dsbal-warn' : 'dsbal-ok' }, usage.peak ? '高峰（北京 9-12 / 14-18）' : '空闲'),
-                '，按官方 v4 价格表分时段计价'))
+                '；历史花费按消耗发生时刻的时段计价并已冻结，不随当前时段变化'))
               usageCard.push(React.createElement('div', { className: 'dsbal-sub', key: 'd' },
                 delta === null
                   ? '余额变化对比：等待余额基线建立…'
                   : React.createElement('span', { className: delta >= 0 ? 'dsbal-ok' : 'dsbal-bad' }, '余额变化：' + delta.toFixed(2) + ' ' + balance.currency + '（自统计起）')))
               usageCard.push(React.createElement('div', { className: 'dsbal-note', key: 's' }, '统计持久化于 ' + fmtTime(usage.startedAt) + ' 起；余额基线 = 首次成功查询时的余额。当前会话的实时消耗见主页输入框下方的摘要条。'))
+              if (usage.pricing) {
+                const pr = usage.pricing
+                usageCard.push(React.createElement('div', { className: 'dsbal-title', key: 'kt' }, '计价缓存（按小时）'))
+                usageCard.push(React.createElement('div', { className: 'dsbal-note', key: 'kn' },
+                  '每次消耗都记录发生时间（北京整点）与当时单价，费用按记录冻结；共 ' + fmtNum(pr.hours) + ' 个整点，'
+                  + '高峰 ' + fmtCompact(pr.peakTokens) + ' tok / 空闲 ' + fmtCompact(pr.offTokens) + ' tok，缓存合计 ≈' + fmtCost(pr.costCny)
+                  + '（与上方估算费用一致）。'))
+                const hourRows = []
+                for (const h of (pr.settled || [])) {
+                  hourRows.push(React.createElement('div', { className: 'dsbal-hour', key: 's-' + h.model },
+                    React.createElement('span', { className: 'dsbal-hour-time' }, '更早 ' + fmtNum(h.hours) + ' 个整点'),
+                    React.createElement('span', { className: 'dsbal-tag' }, '归档'),
+                    React.createElement('span', null, h.model + ' · ' + fmtCompact(h.tokens) + ' tok ≈' + fmtCostShort(h.costCny))))
+                }
+                for (const h of (pr.shown || [])) {
+                  hourRows.push(React.createElement('div', {
+                    className: 'dsbal-hour',
+                    key: h.hour,
+                    title: '计费单价：' + fmtPrice((h.price || {})[h.models[0]]),
+                  },
+                  React.createElement('span', { className: 'dsbal-hour-time' }, fmtHour(h.hour)),
+                  React.createElement('span', { className: 'dsbal-tag' }, h.peak ? '高峰' : '空闲'),
+                  React.createElement('span', null, h.models.join('+') + ' ×' + fmtNum(h.calls) + ' · ' + fmtCompact(h.tokens) + ' tok ≈' + fmtCostShort(h.costCny))))
+                }
+                if (hourRows.length) {
+                  usageCard.push(React.createElement('div', { className: 'dsbal-hours', key: 'kg' }, hourRows))
+                  if (pr.truncated) {
+                    usageCard.push(React.createElement('div', { className: 'dsbal-note', key: 'kt2' }, '另有更早的 ' + fmtNum(pr.truncated) + ' 个整点未展开（仍计入合计）。'))
+                  }
+                } else {
+                  usageCard.push(React.createElement('div', { className: 'dsbal-note', key: 'ke' }, '暂无记录——产生模型消耗后这里会按小时列出。'))
+                }
+              }
               if (tot.perModel && tot.perModel.length) {
                 usageCard.push(React.createElement('div', { className: 'dsbal-title', key: 'mt' }, '按模型明细'))
                 usageCard.push(React.createElement('div', { className: 'dsbal-grid', key: 'mg' },
@@ -196,7 +254,8 @@ if (typeof window !== 'undefined' && typeof window.__ModuleLoader__ !== 'undefin
               }
             }
 
-            // 导出明细（CSV）：按模型 + 按会话；三档口径与界面一致（未命中 = 输入 + 缓存写入）
+            // 导出明细（CSV）：按小时计价缓存 + 按模型 + 按会话；三档口径与界面一致
+            // （未命中 = 输入 + 缓存写入）；费用均为消耗发生时刻冻结的真实花费。
             const exportCsv = () => {
               if (!usage) return
               const missOf = (r) => (r.inputTokens || 0) + (r.cacheWriteTokens || 0)
@@ -205,6 +264,15 @@ if (typeof window !== 'undefined' && typeof window.__ModuleLoader__ !== 'undefin
               const tot = usage.totals || {}
               const totMiss = missOf(tot)
               rows.push(['总计', '全部', tot.calls || 0, totMiss, tot.cacheReadTokens || 0, tot.outputTokens || 0, totMiss + (tot.cacheReadTokens || 0) + (tot.outputTokens || 0), (tot.costCny || 0).toFixed(6)])
+              const pr = usage.pricing
+              if (pr) {
+                for (const h of (pr.shown || [])) {
+                  rows.push(['时段', fmtHour(h.hour) + '（' + (h.peak ? '高峰' : '空闲') + '）', h.calls, h.missTokens, h.hitTokens, h.outputTokens, h.tokens, (h.costCny || 0).toFixed(6)])
+                }
+                for (const h of (pr.settled || [])) {
+                  rows.push(['时段归档', h.model + '（更早 ' + h.hours + ' 个整点）', h.calls, '', '', '', h.tokens, (h.costCny || 0).toFixed(6)])
+                }
+              }
               for (const r of (tot.perModel || [])) {
                 const miss = missOf(r)
                 rows.push(['模型', r.model, r.calls, miss, r.cacheReadTokens, r.outputTokens, miss + r.cacheReadTokens + r.outputTokens, (r.costCny || 0).toFixed(6)])
@@ -247,7 +315,7 @@ if (typeof window !== 'undefined' && typeof window.__ModuleLoader__ !== 'undefin
                 React.createElement('button', { className: 'dsbal-btn', onClick: exportCsv }, '导出明细'),
                 React.createElement('button', { className: 'dsbal-btn', onClick: resetStats }, '重置记录'),
                 error ? React.createElement('span', { className: 'dsbal-bad' }, '刷新出错：' + error) : null),
-              React.createElement('div', { className: 'dsbal-note' }, '每 15 秒自动刷新（余额查询 Host 端缓存 60 秒）。费用按官方价格表（api-docs.deepseek.com/quick_start/pricing）分高峰/空闲时段计价，随调用时刻自动判定。'))
+              React.createElement('div', { className: 'dsbal-note' }, '每 15 秒自动刷新（余额查询 Host 端缓存 60 秒）。费用按官方价格表分高峰/空闲计价，且以「消耗发生时刻」的单价写入计价缓存后冻结——高峰/空闲切换只会影响之后的新消耗，不会改变历史花费。'))
           }
 
           function Summary(props) {
@@ -306,9 +374,7 @@ if (typeof window !== 'undefined' && typeof window.__ModuleLoader__ !== 'undefin
               // token 数字（M/K 缩略），悬停显示三档明细（官方口径）
               const tokEl = (bd) => {
                 const el = React.createElement('span', { className: 'dsbal-models' }, fmtCompact(bd.totalTokens) + ' tok')
-                if (Tooltip === null) return el
-                const detail = fmtBreakdown(bd)
-                return detail ? React.createElement(Tooltip, { label: detail, side: 'top', delayMs: 500 }, el) : el
+                return withDetail(el, fmtBreakdown(bd))
               }
               if (totBd) {
                 totNodes = React.createElement('span', null, '总计 ', React.createElement('span', null, fmtCompact(totBd.totalTokens) + ' tok'), ' ≈' + fmtCostShort(totBd.totalCostCny))
@@ -318,12 +384,10 @@ if (typeof window !== 'undefined' && typeof window.__ModuleLoader__ !== 'undefin
               if (curLabel) {
                 let labelEl = React.createElement('span', { className: 'dsbal-models' }, curLabel)
                 // 模型名上悬停：两模型实际消耗量与估算价对比（与默认 stats 行同款 Tooltip）
-                if (Tooltip !== null) {
-                  const detail = (usage.current.modelsActual || [])
-                    .map((m) => m.model + (m.selected ? '（上次调用）' : '') + '：' + fmtNum(m.tokens) + ' tok ≈' + fmtCostShort(m.costCny))
-                    .join(' · ')
-                  if (detail) labelEl = React.createElement(Tooltip, { label: detail, side: 'top', delayMs: 500 }, labelEl)
-                }
+                const detail = (usage.current.modelsActual || [])
+                  .map((m) => m.model + (m.selected ? '（上次调用）' : '') + '：' + fmtNum(m.tokens) + ' tok ≈' + fmtCostShort(m.costCny))
+                  .join(' · ')
+                labelEl = withDetail(labelEl, detail)
                 if (selBd) {
                   curNodes = React.createElement('span', null, '本会话 (', labelEl, ') ', tokEl(selBd), ' ≈' + fmtCostShort(selBd.totalCostCny))
                 } else {
