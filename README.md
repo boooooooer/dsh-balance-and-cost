@@ -3,8 +3,9 @@
 DeepSeek Harness（DSH）标准 bundle 插件：显示 **DeepSeek 账户余额** 与 **模型消耗量**。
 
 - 主页输入框下方实时摘要条（与系统自带 `stats` 行同一套 pill 排版，单行居中、不换行）：`DeepSeek 余额 ¥xx.xx CNY · 本会话（模型） xx.xM tok ≈¥x.xxx · 总计 xx.xM tok ≈¥x.xxx · 高峰/空闲`（模型名跟随会话最近调用，token 按官方三档口径 M/K 缩略，悬停查看明细）
-- 插件中心（设置 → 插件）「DeepSeek 用量」标签页：余额明细、按模型/按会话统计、**计价缓存按小时明细**、三档悬停、导出 CSV、重置记录
-- 花费按**消耗发生时刻**的时段单价结算并写入计价缓存后冻结——高峰/空闲切换不会再让历史花费跳变；价格表同步到官方 2026-09-10 起的 V4.1-Flash 新价（模型改名与工作日高峰规则一并同步）
+- 插件中心（设置 → 插件）「DeepSeek 用量」标签页：余额明细（**账号登录 / API Key 双通道，多钱包多币种**）、按模型/按会话统计、**计价缓存按小时明细**、三档悬停、导出 CSV、重置记录
+- 花费按**消耗发生时刻**的时段单价结算并写入计价缓存后冻结——高峰/空闲切换不会再让历史花费跳变；高峰规则同步官方：**周一至周五 9-12 / 14-18，且排除中国法定节假日**
+- 价格表不再只能改代码：`$DSH_HOME/dsh-balance-and-cost.pricing.json` 可覆盖模型单价、高峰窗口、节假日与统计的 provider 白名单
 
 纯 JavaScript、零依赖、零构建——GitHub 直装无需构建授权。
 
@@ -42,17 +43,17 @@ DeepSeek Harness（DSH）标准 bundle 插件：显示 **DeepSeek 账户余额**
 
 | 功能 | 说明 |
 |---|---|
-| 余额查询 | `api.deepseek.com/user/balance`，显示总余额 / 充值 / 赠送 / 可用状态（60 秒缓存） |
-| 消耗量统计 | 监听 `llm/stream` 实时累计 DeepSeek 调用，按官方**三档口径**统计（输入·缓存未命中 / 缓存命中 / 输出），区分**总计**与**当前会话**，数字 M/K 缩略 |
-| 按模型计价 | 按实际调用模型匹配官方价格表（含官方改名别名：旧名 `deepseek-v4-flash*` → `deepseek-flash`；支持版本后缀）；未收录模型按 deepseek-flash 估算并标注 |
-| 分时段计价 | 高峰（**工作日**北京 9-12 / 14-18）与空闲价格不同，按**每次调用时刻**即时计价 |
+| 余额查询 | 优先走 DSH 官方账号服务 `deepseekAccount.getBalance`（账号登录用户没有 API Key），未登录再回退 `api.deepseek.com/user/balance`；支持 CNY/USD 等多钱包，显示总余额 / 充值 / 赠送 / 可用状态（60 秒缓存） |
+| 消耗量统计 | 监听 `llm/stream` 实时累计官方 DeepSeek 路由（`deepseek-official` / `deepseek-account`）的调用，按官方**三档口径**统计（输入·缓存未命中 / 缓存命中 / 输出），区分**总计**与**当前会话**，数字 M/K 缩略 |
+| 按模型计价 | 按归一化模型名匹配价格表（旧名 `deepseek-v4-flash*` → `deepseek-flash`），同族只保留一行；未收录模型按 deepseek-flash 估算并标注 |
+| 分时段计价 | 高峰（**工作日**北京 9-12 / 14-18，**排除法定节假日**）与空闲价格不同，按**请求发起时刻**计价 |
 | 计价缓存 | 每次消耗记录**具体时间**（北京整点）+ 当时单价，费用一经记录即**冻结**；时段切换、跨天、重启都不会改变历史花费 |
-| 按小时明细 | 设置页列出最近各整点的时段、调用次数、token 与冻结费用（悬停可见当时单价快照） |
-| 会话明细 | 每个会话显示真实标题、总计行与**分模型行**（flash/pro 固定列出，未调用显示 0 占位） |
+| 按小时明细 | 设置页列出最近各整点的时段、调用次数、token 与冻结费用（悬停可见当时单价快照）；归档分桶保留高峰/空闲口径 |
+| 会话明细 | 每个会话显示真实标题、总计行与**分模型行**（同一模型族只出一行，flash/pro 未调用显示 0 占位） |
 | 三档悬停 | 摘要条 token 数字悬停显示三档明细（含各档费用，三档之和 = 合计）；模型名悬停显示两模型对比 |
-| 导出明细 | 一键导出 CSV（按时段 + 按模型 + 按会话，三档口径，带 BOM 可直接用 Excel 打开） |
-| 重置记录 | 一键清空全部统计、计价缓存与余额基线（带确认，落盘持久化） |
-| 持久化 | 统计与计价缓存落盘 `$DSH_HOME/dsh-balance-and-cost.json`，进程重启后恢复 |
+| 导出明细 | 一键导出 CSV（按时段 + 按模型 + 按会话，三档口径，带 BOM 可直接用 Excel 打开；已做公式注入转义） |
+| 重置记录 | 一键清空全部统计、计价缓存与余额基线（带确认；同源 + CSRF token 校验；已消费的旧分片不会在重启后被合并回来） |
+| 持久化 | 统计与计价缓存落盘 `$DSH_HOME/dsh-balance-and-cost.json`，进程重启后恢复；旧位置分片只在与主文件会话完全不重叠时合并一次，保存前留 `.bak` |
 | 实时更新 | 模型选择 / 用量产生经 SSE 实时推送（浏览器立即刷新）；15 秒轮询作为断连兜底；余额 Host 端 60 秒缓存 |
 
 ## 计价缓存（为什么花费不会突变）
@@ -77,19 +78,46 @@ DeepSeek 价格分高峰/空闲两档。如果展示时用「当前时间」的�
 
 ## 价格表（内置，人民币 / 百万 tokens）
 
-来源：[DeepSeek 官方定价](https://api-docs.deepseek.com/zh-cn/quick_start/pricing)（价格可能变动，请以官方页面为准；编辑 `src/index.js` 的 `PRICES` / `MODEL_ALIASES` 即可更新）
+来源：[DeepSeek 官方定价](https://api-docs.deepseek.com/zh-cn/quick_start/pricing)（价格可能变动，请以官方页面为准；可编辑 `src/index.js` 的 `DEFAULT_PRICES` / `MODEL_ALIASES`，或用下方的定价配置文件覆盖）
 
-**当前生效：v2（2026-09-10 12:00 起）** —— DeepSeek V4.1 Flash 发布后的新价格。
+**当前生效：v3** —— DeepSeek-V4.1-Flash-1017 + DeepSeek-V4-Pro-0813（价格自 2026-09-10 12:00 起未变）。
 
 | 模型 | 输入·缓存未命中 | 输入·缓存命中 | 输出 |
 |---|---|---|---|
 | deepseek-flash（DeepSeek-V4.1-Flash） | 高峰 ¥2.0 / 空闲 ¥1.0 | 高峰 ¥0.04 / 空闲 ¥0.02 | 高峰 ¥8.0 / 空闲 ¥4.0 |
 | deepseek-v4-pro（DeepSeek-V4-Pro-0813） | 高峰 ¥9.0 / 空闲 ¥4.5 | 高峰 ¥0.30 / 空闲 ¥0.15 | 高峰 ¥27.0 / 空闲 ¥13.5 |
 
-- **高峰时段 = 北京时间周一至周五 9:00-12:00、14:00-18:00**，其余（含周末全天）为空闲时段，空闲价为高峰价的一半。
+- **高峰时段 = 北京时间周一至周五（不含中国法定节假日）9:00-12:00、14:00-18:00**，其余（含周末与法定节假日全天）为空闲时段，空闲价为高峰价的一半。内置 2026 年法定节假日（国办发明电〔2025〕7 号）。
 - **模型改名同步**：官方已把 Flash 更名为 `deepseek-flash`；旧名 `deepseek-v4-flash`、`deepseek-v4-flash-0731`、`deepseek-v4-flash-vision-exp` 仍可调用，但请求由 V4.1-Flash 提供服务，因此**按 Flash（deepseek-flash）单价计费**，统计里也归并到 `deepseek-flash` 一行。
-- 缓存写入按输入未命中计价；未收录模型按 `deepseek-flash` 估算并在界面标注。
-- **换表迁移**：`PRICING_VERSION` 递增（价格表变动）时，启动会按计价缓存里各分桶**记录的时间**用新表重算一次——时间取自记录、只换表，所以不会出现「按当前时段重算历史」的突变；没有时间记录的历史 token（0.2.0 之前的聚合值）保持原记录费用，界面标注为估算拆分。
+- 缓存写入按输入未命中计价；未收录模型按 `deepseek-flash` 估算并在界面标注；`deepseek-flash-lite` 这类真正不同的变体不会被并入 flash。
+- **换表迁移**：`PRICING_VERSION` 递增（内置价格表/时段规则变动）时，启动会按计价缓存里各分桶**记录的时间**用新表重算一次——时间取自记录、只换表，所以不会出现「按当前时段重算历史」的突变；没有时间记录的历史 token（0.2.0 之前的聚合值）保持原记录费用，界面标注为估算拆分。定价配置文件只影响之后的消耗，历史费用仍以缓存为准。
+
+### 定价配置文件（可选）
+
+默认读取 `$DSH_HOME/dsh-balance-and-cost.pricing.json`（可用 `DSH_BALANCE_AND_COST_PRICING` 指定路径）。文件不存在时使用内置表；解析/校验失败会在启动日志和设置页提示，并继续使用内置表。
+
+```json
+{
+  "models": {
+    "deepseek-flash": {
+      "inputMiss": { "peak": 2, "off": 1 },
+      "inputHit": { "peak": 0.04, "off": 0.02 },
+      "output": { "peak": 8, "off": 4 }
+    }
+  },
+  "peakWindows": [
+    { "weekdays": [1, 2, 3, 4, 5], "start": 9, "end": 12 },
+    { "weekdays": [1, 2, 3, 4, 5], "start": 14, "end": 18 }
+  ],
+  "holidays": ["2026-10-01", "2026-10-02"],
+  "providers": ["deepseek-official", "deepseek-account"]
+}
+```
+
+- `models` 会**整体替换**内置模型表（可借此加入新模型）；`inputMiss` / `inputHit` / `output` 各含 `peak` / `off` 两档。
+- `weekdays` 用 0=周日 … 6=周六；`start` / `end` 为北京时间整点。
+- `holidays` 会整体替换内置节假日表（`YYYY-MM-DD`）。
+- `providers` 是要统计的 provider 白名单，默认只统计官方 `deepseek-official` / `deepseek-account`；第三方中转（如 `my-deepseek-proxy`）不会被按官方价误计。
 
 ## 安装
 
@@ -99,15 +127,20 @@ dsh plugin --profile web add github:boooooooer/dsh-balance-and-cost
 
 # 或本地目录 / tarball
 dsh plugin --profile web add ./dsh-balance-and-cost
-pnpm pack   # 生成 tarball 后：dsh plugin --profile web add ./dsh-balance-and-cost-0.1.0.tgz
+pnpm pack   # 生成 tarball 后：dsh plugin --profile web add ./dsh-balance-and-cost-0.4.0.tgz
 ```
 
 安装后**重启 dsh**（bundle 层在启动时组合）。卸载：`dsh plugin --profile web remove dsh-balance-and-cost`。
 
 ### 配置
 
-- **API Key**：插件通过 DSH 的 `credentials` 服务解析 `DEEPSEEK_API_KEY`（`~/.dsh/.credentials.yaml` 或同名环境变量），代码中不含任何密钥
-- 统计文件：`$DSH_HOME/dsh-balance-and-cost.json`（可在设置页「重置记录」一键清空，或直接删除文件）
+- **余额来源**：优先 DSH 账号登录（`deepseekAccount`），未登录时回退 `credentials` 解析 `DEEPSEEK_API_KEY`（`~/.dsh/.credentials.yaml` 或同名环境变量），代码中不含任何密钥
+- **改过 API Key 环境变量名**：设置 `DSH_BALANCE_AND_COST_API_KEY_ENV=<你的变量名>`
+- **网关 / 中转**：设置 `DSH_BALANCE_AND_COST_BASE_URL=<网关根地址>`（余额查询会用它的 origin）
+- **统计哪些 provider**：默认 `deepseek-official` / `deepseek-account`；可用 `DSH_BALANCE_AND_COST_PROVIDERS=a,b` 或配置文件扩展
+- **远程访问**：路由只接受回环/私有网段/DSH 监听地址；通过公网域名访问时用 `DSH_BALANCE_AND_COST_ALLOWED_HOSTS=host1,host2` 显式放行
+- **统计文件**：`$DSH_HOME/dsh-balance-and-cost.json`（保存前留 `.bak`；可在设置页「重置记录」一键清空，或直接删除文件）
+- **定价/节假日/Provider 覆盖**：`$DSH_HOME/dsh-balance-and-cost.pricing.json`（见上）
 
 ## 目录结构
 
@@ -116,11 +149,12 @@ dsh-balance-and-cost/
 ├── package.json        # dsh.bundle.patch + dsh.client 声明
 ├── cordis.patch.yml    # bundle 补丁层：insert 插件行
 ├── src/
-│   ├── index.js        # node half：llm/stream 统计、计价缓存、余额查询、HTTP/SSE 路由
+│   ├── index.js        # node half：llm/stream 统计、计价缓存、余额（账号/API Key）、HTTP/SSE 路由
 │   └── client.js       # browser half：摘要条 + 设置页（__ModuleLoader__ 加载）
 ├── test/
-│   ├── smoke.mjs           # 单元冒烟：manifest / 计价 / 计价缓存回归
-│   └── host-integration.mjs # 端到端：假 ctx 挂载 → 统计 → 快照 → 落盘 → 恢复
+│   ├── smoke.mjs           # 单元冒烟：manifest / 计价 / 节假日 / 归一化 / 分片只消费一次
+│   ├── host-integration.mjs # 端到端：假 ctx 挂载 → 统计 → 快照 → 落盘 → 恢复 → CSRF → 账号余额
+│   └── client-render.mjs    # 假 React/slots 渲染：槽位注册 + 摘要条 + 设置页
 ├── assets/             # 界面截图
 ├── README.md
 └── LICENSE
@@ -130,32 +164,39 @@ dsh-balance-and-cost/
 
 | 文件 | 职责 |
 |---|---|
-| `src/index.js` | `export const name` + `export function apply(ctx)`；`ctx.webServer.register` 暴露四个端点：`/balance`（余额，60s 缓存）、`/usage`（用量快照，含计价缓存视图，支持 `?sessionId=`）、`/events`（SSE 实时推送）、`/reset`（POST 清空统计） |
+| `src/index.js` | `export const name` + `export function apply(ctx)`；`llm/stream` 统计 + 计价缓存；`webServer` 为可选依赖，存在时注册四个端点：`/balance`（余额，60s 缓存）、`/usage`（用量快照，含计价缓存视图与 CSRF token，支持 `?sessionId=`）、`/events`（SSE 实时推送）、`/reset`（POST 清空统计） |
 | `src/client.js` | `window.__ModuleLoader__.load({ id, factory })` 注册浏览器插件；`inject: ['slots']` + `ctx.slots` 注入「摘要条 + 设置页」两个位置（DSH 0.1.5 起客户端插件必须声明依赖的 cordis 服务，`ctx.get(...)` 对未声明服务可能取不到），`fetch` 调用上述端点，`EventSource` 订阅 `/events` |
 
-费用在 Host 端按**消耗到达时刻**的时段单价结算并写入计价缓存（`ledger`）后冻结：
-摘要条与本会话/总计的三档拆分都是对缓存的求和，因此跨时段、跨天、重启后的历史花费都精确不变；
+费用在 Host 端按**请求发起时刻**的时段单价结算并写入计价缓存（`ledger`）后冻结：
+摘要条与本会话/总计的三档拆分都是对缓存的求和，因此跨时段、跨天、重启后的历史花费都精确不变。
+`llm/stream` 只统计官方 DeepSeek 路由（默认 `deepseek-official` / `deepseek-account`），
 统计按会话隔离读取（会话日志），进程重启后从持久化恢复。
+
+HTTP 端点做了三层防护：Host 白名单（回环 / 私有网段 / DSH 监听地址，挡 DNS rebinding）、
+`/reset` 与 `/events` 的同源校验、以及 `/usage` 下发、`/reset` 必须携带的 CSRF token。
 
 ## 开发与测试
 
 ```sh
 npm test                          # 下面三个用例一起跑
-node test/smoke.mjs               # manifest / 两端模块加载 / 分时段计价 / 计价缓存（时段切换不跳变）
-node test/host-integration.mjs    # 假 ctx 端到端：llm/stream 统计 → /usage 快照 → 落盘 → 重启恢复 → 重置
-node test/client-render.mjs       # 假 React/slots 渲染：槽位注册 + 摘要条 + 设置页（含计价缓存区块）
+node test/smoke.mjs               # manifest / 分时段与节假日计价 / 归一化 / 分片只消费一次
+node test/host-integration.mjs    # 假 ctx 端到端：统计 → 快照 → 落盘 → 重启 → CSRF → 账号余额
+node test/client-render.mjs       # 假 React/slots 渲染：槽位注册 + 摘要条 + 设置页 + 多币种
 ```
 
 改动记录见 [CHANGELOG.md](CHANGELOG.md)，安全设计见 [SECURITY.md](SECURITY.md)。
 
 ## 已知限制
 
-- 只统计 provider 含 `deepseek` 的模型调用（`deepseek-official` 等路由）
+- 只统计官方 DeepSeek 路由（默认 `deepseek-official` / `deepseek-account`）；第三方中转不会被按官方价计费，需要时用定价配置文件的 `providers` 显式加入
 - 费用为估算值（官方单价 × token 用量），实际扣费以 DeepSeek 账单为准
 - 重放（replay）的模型调用可能重复计入（近似）
 - 升级前落盘的历史 token 没有时间记录，其三档拆分是估算值（合计仍为真实花费，界面有标注）；价格表更新时这部分历史费用不会被重算
 - 计价缓存只保留最近 720 个整点（30 天）的时间粒度，更早的折叠为归档合计（同样不参与换表重算）
-- 会话的进程内「当前选中但未调用」模型为 DSH 私有状态，插件侧显示会话最近调用模型（`requestHeader`）或全局默认
+- 0.4.0 之前的版本在迁移后可能把旧分片重复合并过（每次启动 +1 份旧数据），这部分历史膨胀不会自动回滚；建议升级后「重置记录」一次，或按旧分片大小手动核对
+- 余额的账号通道依赖 DSH 的 `deepseekAccount` 服务（DSH 0.2.x 提供）；更老的 DSH 只有 API Key 通道
+- 走网关/中转时要显式设置 `DSH_BALANCE_AND_COST_BASE_URL`，否则余额会查官方域名
+- 会话的进程内「当前选中但未调用」模型为 DSH 私有状态：非 live 会话回退到全局默认模型，摘要条会在该模型本会话无消耗时自动改显会话合计
 
 ## License
 

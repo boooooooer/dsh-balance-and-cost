@@ -183,4 +183,30 @@ stateQueue = [null, null, null, false]
 const emptyText = textOf(panelReg.component())
 assert.ok(emptyText.includes('加载中'), '未取到数据时应显示加载中')
 
-console.log('client render OK: 槽位注册 / 摘要条 / 设置页 / 计价缓存区块 / 空数据降级')
+// ── 多币种余额：账号登录来源 + 每个钱包都要渲染 ─────────────────────────────
+const multiBalance = {
+  ok: true, source: 'account', isAvailable: true, currency: 'CNY',
+  totalBalance: 88.5, grantedBalance: 8.5, toppedUpBalance: 80,
+  wallets: [
+    { currency: 'CNY', total: 88.5, granted: 8.5, toppedUp: 80 },
+    { currency: 'USD', total: 3.25, granted: 0, toppedUp: 3.25 },
+  ],
+}
+stateQueue = [multiBalance, usage, null, false]
+const multiText = textOf(panelReg.component())
+assert.ok(multiText.includes('USD 余额') && multiText.includes('3.25 USD'), '多币种钱包都要显示')
+assert.ok(multiText.includes('账号登录'), '余额来源应标注账号登录')
+
+// ── 选中模型在本会话无消耗：回退会话合计，不显示 0 tok ──────────────────────
+const zeroUsage = JSON.parse(JSON.stringify(usage))
+zeroUsage.current.selectedBreakdown = {
+  ...zeroUsage.current.selectedBreakdown,
+  missTokens: 0, hitTokens: 0, outputTokens: 0, totalTokens: 0,
+  missCostCny: 0, hitCostCny: 0, outputCostCny: 0, totalCostCny: 0,
+}
+stateQueue = [balance, zeroUsage, null]
+const zeroText = textOf(summaryReg.component({ sessionId: 's1' }))
+assert.ok(!zeroText.includes('0 tok'), '选中模型无消耗时不应显示 0 tok')
+assert.ok(zeroText.includes('6.2K tok'), '应回退显示会话合计 token')
+
+console.log('client render OK: 槽位注册 / 摘要条 / 设置页 / 计价缓存区块 / 多币种余额 / 零消耗回退 / 空数据降级')

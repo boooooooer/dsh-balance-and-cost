@@ -18,26 +18,164 @@
  *     /__dsh-balance-and-cost/balance   → 余额快照
  *     /__dsh-balance-and-cost/usage     → 用量快照（?sessionId= 取当前会话维度）
  */
-import { readFileSync, writeFileSync, renameSync, mkdirSync, existsSync, statSync } from 'node:fs'
+import { readFileSync, writeFileSync, renameSync, mkdirSync, existsSync, statSync, copyFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { homedir } from 'node:os'
+import { randomUUID } from 'node:crypto'
 
 export const name = 'dsh-balance-and-cost'
-// webServer 由 web 组合保证提供；声明为硬依赖使 apply 等待其就绪后再运行。
-export const inject = ['webServer']
+// webServer 只在 Web 组合里存在：不再作为硬依赖，headless/CLI 组合里仍然统计用量；
+// Web 组合里再用 ctx.inject(['webServer'], …) 注册 HTTP 端点（见 apply）。
+export const inject = []
+
+// 北京时间偏移：高峰/空闲判定与整点分桶都用它，且与宿主时区无关。
+const BEIJING_OFFSET_MS = 8 * 60 * 60 * 1000
 
 // 官方价格表（api-docs.deepseek.com/zh-cn/quick_start/pricing，人民币 / 百万 tokens）。
-// 2026-09-10 12:00 起生效（DeepSeek V4.1 Flash 发布，Flash 降价；V4 Pro 计费不变）：
+// 现行表：DeepSeek-V4.1-Flash-1017 + DeepSeek-V4-Pro-0813（2026-09-10 12:00 起的价格未再变动）：
 //   deepseek-flash（V4.1-Flash）：未命中 高峰2/空闲1，命中 高峰0.04/空闲0.02，输出 高峰8/空闲4
 //   deepseek-v4-pro（V4-Pro-0813）：未命中 高峰9/空闲4.5，命中 高峰0.30/空闲0.15，输出 高峰27/空闲13.5
-// 高峰 = 北京时间**周一至周五** 9:00-12:00、14:00-18:00（其余含周末为空闲）；
-// 缓存写入按输入未命中计价；未收录模型按 deepseek-flash 估算。
-const PRICES = {
+// 高峰 = 北京时间**周一至周五（不含中国法定节假日）** 9:00-12:00、14:00-18:00；其余（含周末与
+// 法定节假日）为空闲。缓存写入按输入未命中计价；未收录模型按 deepseek-flash 估算。
+// 价格表可通过 $DSH_HOME/dsh-balance-and-cost.pricing.json（或 DSH_BALANCE_AND_COST_PRICING 指向的
+// JSON 文件）覆盖，见 apply 里的 loadPricingOverrides / configurePricing。
+const DEFAULT_PRICES = {
   'deepseek-flash': { inputMiss: { peak: 2.0, off: 1.0 }, inputHit: { peak: 0.04, off: 0.02 }, output: { peak: 8.0, off: 4.0 } },
   'deepseek-v4-pro': { inputMiss: { peak: 9.0, off: 4.5 }, inputHit: { peak: 0.30, off: 0.15 }, output: { peak: 27.0, off: 13.5 } },
 }
 const FALLBACK_KEY = 'deepseek-flash'
-const FALLBACK = PRICES[FALLBACK_KEY]
+const DEFAULT_PEAK_WINDOWS = [
+  { weekdays: [1, 2, 3, 4, 5], start: 9, end: 12 },
+  { weekdays: [1, 2, 3, 4, 5], start: 14, end: 18 },
+]
+// 2026 年法定节假日（国办发明电〔2025〕7 号，含调休形成的连休；周末本来就算空闲，重复无影响）。
+// 只影响高峰/空闲判定；2027 年及以后可用定价配置文件覆盖。
+const DEFAULT_HOLIDAY_RANGES = [
+  ['2026-01-01', 3], ['2026-02-15', 9], ['2026-04-04', 3], ['2026-05-01', 5],
+  ['2026-06-19', 3], ['2026-09-25', 3], ['2026-10-01', 7],
+]
+
+const clone = (value) => JSON.parse(JSON.stringify(value))
+
+function expandDateRange(start, days) {
+  const out = []
+  const base = Date.parse(start + 'T00:00:00Z')
+  for (let i = 0; i < days; i += 1) out.push(new Date(base + i * 86400000).toISOString().slice(0, 10))
+  return out
+}
+const DEFAULT_HOLIDAYS = DEFAULT_HOLIDAY_RANGES.flatMap(([start, days]) => expandDateRange(start, days))
+
+let PRICES = clone(DEFAULT_PRICES)
+let PEAK_WINDOWS = clone(DEFAULT_PEAK_WINDOWS)
+let HOLIDAYS = new Set(DEFAULT_HOLIDAYS)
+let PRICING_SOURCE = 'builtin'
+
+// 只统计官方 DeepSeek 路由（deepseek-official / deepseek-account）。不做 provider 子串匹配，
+// 避免把名为 my-deepseek-proxy 的第三方路由按官方价计费。可用 DSH_BALANCE_AND_COST_PROVIDERS
+// 或定价配置文件的 providers 数组覆盖。
+const DEFAULT_PROVIDERS = ['deepseek-official', 'deepseek-account']
+let METERED_PROVIDERS = new Set(DEFAULT_PROVIDERS)
+
+export function isMeteredProvider(provider) {
+  return METERED_PROVIDERS.has(String(provider || '').trim().toLowerCase())
+}
+
+function fallbackTable() {
+  return PRICES[FALLBACK_KEY] || Object.values(PRICES)[0] || DEFAULT_PRICES[FALLBACK_KEY]
+}
+
+const isObject = (value) => typeof value === 'object' && value !== null && !Array.isArray(value)
+const isPositiveNumber = (value) => typeof value === 'number' && Number.isFinite(value) && value >= 0
+const isDateString = (value) => typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value)
+
+function parsePriceTable(table) {
+  if (!isObject(table)) return null
+  const picked = {}
+  for (const key of ['inputMiss', 'inputHit', 'output']) {
+    const pair = table[key]
+    if (!isObject(pair) || !isPositiveNumber(pair.peak) || !isPositiveNumber(pair.off)) return null
+    picked[key] = { peak: pair.peak, off: pair.off }
+  }
+  return picked
+}
+
+function parsePeakWindow(window) {
+  if (!isObject(window)) return null
+  const weekdays = Array.isArray(window.weekdays) ? window.weekdays.filter((d) => Number.isInteger(d) && d >= 0 && d <= 6) : []
+  const start = window.start
+  const end = window.end
+  if (weekdays.length === 0) return null
+  if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0 || end > 24 || start >= end) return null
+  return { weekdays: [...new Set(weekdays)], start, end }
+}
+
+// 覆盖内置价格表/高峰窗口/节假日。只影响**之后**产生的消耗；历史费用仍以计价缓存为准。
+// 返回 { applied, errors }，供启动日志和设置页展示。
+export function configurePricing(config, meta = {}) {
+  const errors = []
+  if (!isObject(config)) return { applied: false, errors: ['config is not an object'], priceChanged: false }
+  let applied = false
+  let priceChanged = false
+  if (config.models !== undefined) {
+    if (!isObject(config.models)) {
+      errors.push('models must be an object')
+    } else {
+      const next = {}
+      for (const [model, table] of Object.entries(config.models)) {
+        const parsed = parsePriceTable(table)
+        if (parsed === null) errors.push('invalid price table for ' + model)
+        else next[String(model).toLowerCase()] = parsed
+      }
+      if (Object.keys(next).length > 0) {
+        PRICES = next
+        applied = true
+        priceChanged = true
+      }
+    }
+  }
+  if (config.peakWindows !== undefined) {
+    if (!Array.isArray(config.peakWindows)) {
+      errors.push('peakWindows must be an array')
+    } else {
+      const windows = config.peakWindows.map(parsePeakWindow).filter((item) => item !== null)
+      if (windows.length === 0) errors.push('peakWindows contains no valid window')
+      else {
+        PEAK_WINDOWS = windows
+        applied = true
+        priceChanged = true
+      }
+    }
+  }
+  if (config.holidays !== undefined) {
+    if (!Array.isArray(config.holidays)) {
+      errors.push('holidays must be an array of YYYY-MM-DD strings')
+    } else {
+      const valid = config.holidays.filter(isDateString)
+      if (valid.length !== config.holidays.length) errors.push('holidays contains invalid dates')
+      HOLIDAYS = new Set(valid)
+      applied = true
+      priceChanged = true
+    }
+  }
+  if (config.providers !== undefined) {
+    if (!Array.isArray(config.providers)) {
+      errors.push('providers must be an array of provider ids')
+    } else {
+      const list = config.providers.map((p) => String(p || '').trim().toLowerCase()).filter((p) => p.length > 0)
+      if (list.length === 0) errors.push('providers contains no valid provider id')
+      else {
+        METERED_PROVIDERS = new Set(list)
+        applied = true
+      }
+    }
+  }
+  if (priceChanged) {
+    PRICING_SOURCE = meta.source || 'config'
+    PRICING_INFO.source = PRICING_SOURCE
+    PRICING_INFO.modelVersion = Object.keys(PRICES).join(' / ')
+  }
+  return { applied, errors, priceChanged }
+}
 
 // 模型名 → 价格表 key 的别名表（官方改名/下线后旧名仍会路由到新模型并按其单价计费）：
 //   deepseek-v4-flash、deepseek-v4-flash-vision-exp  → 由 DeepSeek-V4.1-Flash 提供服务，按 Flash 计价
@@ -49,22 +187,38 @@ const MODEL_ALIASES = {
   'deepseek-v4-pro': 'deepseek-v4-pro',
 }
 
-// 价格表元信息：版本号用于「历史分桶换表重算」的一次性迁移（见 apply 内 repriceLedger）
-export const PRICING_VERSION = 2
+// 归一化时允许裁掉的版本/日期后缀：0731、1017、v4.1、2026-09-10、vision-exp 等。
+// 不能裁掉 deepseek-flash-lite / deepseek-flash-pro 这类真正不同的模型（否则会被错误并入 flash 计价）。
+const VERSION_SUFFIX = /^(?:v?\d+(?:[.-]\d+)*|vision-exp|\d{4}(?:-\d{2}){0,2})$/i
+
+// 价格表元信息：版本号用于「历史分桶换表重算」的一次性迁移（见 apply 内 repriceLedger）。
+// v3：高峰规则补上「不含中国法定节假日」，启动时按新规则重算一次历史分桶的时段标记。
+export const PRICING_VERSION = 3
 export const PRICING_INFO = {
   version: PRICING_VERSION,
   effectiveAt: '2026-09-10T12:00:00+08:00',
+  modelVersion: 'DeepSeek-V4.1-Flash-1017 / DeepSeek-V4-Pro-0813',
   source: 'https://api-docs.deepseek.com/zh-cn/quick_start/pricing',
-  peakRule: '高峰 = 北京时间周一至周五 9:00-12:00、14:00-18:00；其余（含周末）为空闲',
+  peakRule: '高峰 = 北京时间周一至周五（不含中国法定节假日）9:00-12:00、14:00-18:00；其余（含周末与法定节假日）为空闲',
+  holidayRule: '2026 年法定节假日按国办发明电〔2025〕7 号；可用定价配置文件覆盖',
 }
 
-// 北京时间的高峰判定：工作日（周一至周五）+ 9-12 / 14-18
+// 北京时间的日/时/日期（与宿主时区无关）
+function beijingParts(date) {
+  const shifted = new Date(date.getTime() + BEIJING_OFFSET_MS)
+  const p = (n) => String(n).padStart(2, '0')
+  return {
+    day: shifted.getUTCDay(), // 0=周日 … 6=周六
+    hour: shifted.getUTCHours(),
+    date: shifted.getUTCFullYear() + '-' + p(shifted.getUTCMonth() + 1) + '-' + p(shifted.getUTCDate()),
+  }
+}
+
+// 高峰判定：落在任一高峰窗口内，且当天不是中国法定节假日（节假日全天空闲，周末本来就不在窗口内）
 export function isPeak(date) {
-  const shifted = new Date(date.getTime() + 8 * 60 * 60 * 1000) // 平移后 UTC 字段 = 北京时间字段
-  const day = shifted.getUTCDay() // 0=周日 … 6=周六
-  if (day === 0 || day === 6) return false
-  const h = shifted.getUTCHours()
-  return (h >= 9 && h < 12) || (h >= 14 && h < 18)
+  const { day, hour, date: ymd } = beijingParts(date)
+  if (HOLIDAYS.has(ymd)) return false
+  return PEAK_WINDOWS.some((w) => w.weekdays.includes(day) && hour >= w.start && hour < w.end)
 }
 
 // 解析模型名 → 价格表条目。先查别名表（覆盖改名与版本后缀），未收录返回 undefined。
@@ -74,7 +228,7 @@ function resolvePriceTable(model) {
 
 // 返回该时刻的具体单价（元/百万 tokens）
 export function priceFor(model, date) {
-  const table = resolvePriceTable(model) || FALLBACK
+  const table = resolvePriceTable(model) || fallbackTable()
   const peak = isPeak(date)
   const pick = (v) => (peak ? v.peak : v.off)
   return {
@@ -87,30 +241,33 @@ export function priceFor(model, date) {
   }
 }
 
-// 模型名归一化到价格表 key：先查别名（官方改名/下线后的旧名），再按别名前缀匹配版本后缀
-// （deepseek-v4-pro-0813 → deepseek-v4-pro），未收录模型保留原始名。
+// 模型名归一化到价格表 key：先查别名（官方改名/下线后的旧名），再按别名 + 明确的版本/日期后缀
+// 匹配（deepseek-v4-pro-0813 → deepseek-v4-pro），未收录模型保留原始名。
 // 归一化后的名字同时作为统计与计价缓存的 key。
 export function normalizeModel(model) {
   const raw = String(model || 'unknown')
   const m = raw.toLowerCase()
   if (MODEL_ALIASES[m] !== undefined) return MODEL_ALIASES[m]
   for (const alias of Object.keys(MODEL_ALIASES)) {
-    if (m.startsWith(alias + '-') || m.startsWith(alias + '_')) return MODEL_ALIASES[alias]
+    if (m.length <= alias.length + 1) continue
+    if (!m.startsWith(alias + '-') && !m.startsWith(alias + '_')) continue
+    if (VERSION_SUFFIX.test(m.slice(alias.length + 1))) return MODEL_ALIASES[alias]
   }
   return raw
 }
 
-// 存储 key 与查询名的前缀匹配（兼容历史 key 分裂：deepseek-v4-flash + deepseek-v4-flash-0731）
+// 存储 key 与查询名的前缀匹配（保留给外部/历史调用；统计内部已改用归一化后的精确匹配）
 export function prefixMatch(stored, wanted) {
   const s = String(stored || '')
   const w = String(wanted || '')
   return s === w || s.startsWith(w + '-') || s.startsWith(w + '_')
 }
 
-// 模型名比对：两侧先归一到价格表 key 再前缀匹配。会话配置里的模型名可能带版本后缀
-// （deepseek-v4-flash-0731）而统计 key 已归一化，双向归一后才能在两个方向命中同族记录。
+// 模型名比对：两侧先归一到价格表 key 再比较。会话配置里的模型名可能带版本后缀
+// （deepseek-v4-flash-0731）而统计 key 已归一化，归一后精确相等才算是同一模型——
+// 不再做任意前缀匹配，避免 deepseek-flash-lite 之类被并入 flash。
 export function modelMatches(stored, wanted) {
-  return prefixMatch(normalizeModel(stored), normalizeModel(wanted))
+  return normalizeModel(stored) === normalizeModel(wanted)
 }
 
 // ── 计价缓存（cost ledger）───────────────────────────────────────────────────
@@ -123,7 +280,6 @@ export function modelMatches(stored, wanted) {
 // 展示层只做「求和」，不再用当前时间给历史 token 重新定价。
 // 计价缓存版本 = 价格表版本：两者一起递增，用于「换表重算」的一次性迁移标记
 const LEDGER_VERSION = PRICING_VERSION
-const BEIJING_OFFSET_MS = 8 * 60 * 60 * 1000
 const LEDGER_MAX_BUCKETS = 720 // 保留最近 720 个整点（30 天），更早的折叠进 settled
 const LEDGER_VIEW_MAX = 24 // 对外暴露的最近分桶行数
 
@@ -155,7 +311,12 @@ function pruneLedger(ledger) {
       const row = bucket.models[model]
       let s = ledger.settled[model]
       if (!s) {
-        s = { calls: 0, missTokens: 0, hitTokens: 0, outputTokens: 0, missCostCny: 0, hitCostCny: 0, outputCostCny: 0, hours: 0, firstAt: bucket.at, lastAt: bucket.at }
+        s = {
+          calls: 0, missTokens: 0, hitTokens: 0, outputTokens: 0,
+          missCostCny: 0, hitCostCny: 0, outputCostCny: 0,
+          hours: 0, peakTokens: 0, offTokens: 0,
+          firstAt: bucket.at, lastAt: bucket.at,
+        }
         ledger.settled[model] = s
       }
       s.calls += row.calls
@@ -165,6 +326,10 @@ function pruneLedger(ledger) {
       s.missCostCny += row.missCostCny
       s.hitCostCny += row.hitCostCny
       s.outputCostCny += row.outputCostCny
+      // 归档时保留高峰/空闲口径，否则 30 天后的「高峰/空闲 token」会全部算成空闲
+      const tok = (row.missTokens || 0) + (row.hitTokens || 0) + (row.outputTokens || 0)
+      if (bucket.peak) s.peakTokens = (s.peakTokens || 0) + tok
+      else s.offTokens = (s.offTokens || 0) + tok
       s.hours += 1
       s.firstAt = Math.min(s.firstAt, bucket.at)
       s.lastAt = Math.max(s.lastAt, bucket.at)
@@ -226,7 +391,7 @@ export function ledgerTotals(ledger, model) {
   }
   if (!ledger || typeof ledger !== 'object') return out
   const wanted = model === null || model === undefined ? null : normalizeModel(model)
-  const add = (row, peak, at) => {
+  const addCounts = (row) => {
     out.calls += row.calls || 0
     out.missTokens += row.missTokens || 0
     out.hitTokens += row.hitTokens || 0
@@ -235,25 +400,35 @@ export function ledgerTotals(ledger, model) {
     out.hitCostCny += row.hitCostCny || 0
     out.outputCostCny += row.outputCostCny || 0
     if (row.estimated) out.estimated = true
-    const tok = (row.missTokens || 0) + (row.hitTokens || 0) + (row.outputTokens || 0)
-    if (peak) out.peakTokens += tok
-    else out.offTokens += tok
-    if (typeof at === 'number') {
-      out.hours += 1
-      out.firstAt = out.firstAt === null ? at : Math.min(out.firstAt, at)
-      out.lastAt = out.lastAt === null ? at : Math.max(out.lastAt, at)
-    }
+    return (row.missTokens || 0) + (row.hitTokens || 0) + (row.outputTokens || 0)
+  }
+  const addAt = (at) => {
+    if (typeof at !== 'number') return
+    out.hours += 1
+    out.firstAt = out.firstAt === null ? at : Math.min(out.firstAt, at)
+    out.lastAt = out.lastAt === null ? at : Math.max(out.lastAt, at)
   }
   for (const key of Object.keys(ledger.buckets || {})) {
     const bucket = ledger.buckets[key]
     for (const name of Object.keys(bucket.models || {})) {
       if (wanted !== null && !modelMatches(name, wanted)) continue
-      add(bucket.models[name], bucket.peak, bucket.at)
+      const tok = addCounts(bucket.models[name])
+      if (bucket.peak) out.peakTokens += tok
+      else out.offTokens += tok
+      addAt(bucket.at)
     }
   }
   for (const name of Object.keys(ledger.settled || {})) {
     if (wanted !== null && !modelMatches(name, wanted)) continue
-    add(ledger.settled[name], false, null)
+    const row = ledger.settled[name]
+    const tok = addCounts(row)
+    // 新归档保留时段拆分；旧数据没有时段信息，按空闲计（与升级前行为一致）
+    if (typeof row.peakTokens === 'number' || typeof row.offTokens === 'number') {
+      out.peakTokens += row.peakTokens || 0
+      out.offTokens += row.offTokens || 0
+    } else {
+      out.offTokens += tok
+    }
   }
   out.totalCostCny = out.missCostCny + out.hitCostCny + out.outputCostCny
   return out
@@ -450,19 +625,23 @@ export const LEGACY_DATA_FILES = ENV_LEGACY_FILES
       resolve('/.dsh/' + DATA_FILENAME),
     ].filter((p) => p !== null && p !== DATA_FILE))
 
-// 读取一个统计文件（含 mtime，用于判断新旧分片是否互补）
+// 读取一个统计文件（含 size/mtime，用于记录「该分片已被消费」的指纹）
 function readOneStatsFile(path) {
   if (!existsSync(path)) return null
   try {
     const raw = JSON.parse(readFileSync(path, 'utf8'))
     if (!raw || typeof raw !== 'object') return null
     let mtimeMs = 0
+    let size = 0
     try {
-      mtimeMs = statSync(path).mtimeMs
+      const st = statSync(path)
+      mtimeMs = st.mtimeMs
+      size = st.size
     } catch {
       mtimeMs = 0
+      size = 0
     }
-    return { path, raw, mtimeMs }
+    return { path, raw, mtimeMs, size }
   } catch {
     return null
   }
@@ -502,7 +681,7 @@ function readStatsFile() {
 
 // 判定旧文件是不是「同一份数据的副本」：它的每个会话都已在主文件里、且调用次数完全一致。
 // 不同进程写出的分片即使会话 id 相同，各进程也只统计自己发起的调用，次数不会雷同，
-// 因此该判定只拦真正的文件副本，互补分片照常合并。
+// 因此该判定只拦真正的文件副本（保留导出供测试/诊断）。
 export function isDuplicateShard(primarySessions, otherSessions) {
   const ids = Object.keys(otherSessions || {})
   if (ids.length === 0) return false
@@ -514,10 +693,54 @@ export function isDuplicateShard(primarySessions, otherSessions) {
   return true
 }
 
-// 哪些旧文件需要合并进主文件（排除主文件自身与完全重复的副本）
-export function planLegacyMerge(primary, others) {
+// 旧文件的内容是否已被主文件「包含」：每个会话都在主文件里且调用次数不少于旧文件。
+// 保留为诊断/测试工具；实际合并策略见 isDisjointShard。
+export function isContainedShard(primarySessions, otherSessions) {
+  const ids = Object.keys(otherSessions || {})
+  if (ids.length === 0) return false
+  for (const id of ids) {
+    const mine = primarySessions[id]
+    if (mine === undefined) return false
+    if ((mine.calls || 0) < (otherSessions[id].calls || 0)) return false
+  }
+  return true
+}
+
+// 只有「所有会话都还没出现在主文件里」的旧分片才整体合并。
+// 只要有一个会话重叠，就说明这份旧文件与主文件同源（迁移前的副本/子集），
+// 整体合并会把重叠会话重复计数——宁可跳过，也不要把金额算多。
+export function isDisjointShard(primarySessions, otherSessions) {
+  const ids = Object.keys(otherSessions || {})
+  if (ids.length === 0) return false
+  for (const id of ids) {
+    if (primarySessions[id] !== undefined) return false
+  }
+  return true
+}
+
+// 记录一个分片已被消费（path → 指纹）。持久化在统计文件里，跨重启生效。
+export function recordConsumedShard(stats, path, extra = {}) {
+  if (!stats || !path) return
+  if (!stats.mergedShards || typeof stats.mergedShards !== 'object') stats.mergedShards = {}
+  let fingerprint = {}
+  try {
+    const st = statSync(path)
+    fingerprint = { size: st.size, mtimeMs: Math.round(st.mtimeMs) }
+  } catch {
+    fingerprint = {}
+  }
+  stats.mergedShards[path] = { at: Date.now(), ...fingerprint, ...extra }
+}
+
+// 哪些旧文件需要合并进主文件：排除主文件自身、已消费过的（mergedShards）、
+// 空分片，以及任何与主文件存在会话重叠的旧文件。
+export function planLegacyMerge(primary, others, mergedShards = {}) {
   const primarySessions = primary.sessions || {}
-  return others.filter((other) => other.path !== primary.path && !isDuplicateShard(primarySessions, other.sessions))
+  return others.filter((other) => {
+    if (other.path === primary.path) return false
+    if (mergedShards && mergedShards[other.path]) return false
+    return isDisjointShard(primarySessions, other.sessions)
+  })
 }
 
 function mergeLedgerInto(dst, src) {
@@ -570,6 +793,30 @@ function mergeLedgerInto(dst, src) {
 
 const SUM_FIELDS = ['calls', 'inputTokens', 'outputTokens', 'cacheReadTokens', 'cacheWriteTokens', 'reasoningTokens', 'costCny']
 
+// 把 perModel 归一到「provider:归一化模型名」：升级前后的旧名（deepseek-v4-flash）与新名
+// （deepseek-flash）合并成一行，并按当前价目表重算 estimated（不再让旧标记永久粘住）。
+export function normalizePerModel(perModel) {
+  const out = {}
+  for (const key of Object.keys(perModel || {})) {
+    const row = perModel[key]
+    if (!row || typeof row !== 'object') continue
+    const provider = String(row.provider || String(key).split(':')[0] || '')
+    const model = normalizeModel(row.model || String(key).split(':').slice(1).join(':') || key)
+    const nk = provider + ':' + model
+    let target = out[nk]
+    if (!target) {
+      target = out[nk] = { ...row, provider, model }
+      target.estimated = PRICES[model] === undefined
+    } else {
+      for (const field of ['calls', 'inputTokens', 'outputTokens', 'cacheReadTokens', 'cacheWriteTokens', 'costCny']) {
+        target[field] = (target[field] || 0) + (row[field] || 0)
+      }
+    }
+  }
+  for (const key of Object.keys(out)) out[key].estimated = PRICES[out[key].model] === undefined
+  return out
+}
+
 // 合并两份互补的统计（分片）：计数相加、会话并集、计价缓存按整点相加
 export function mergeStats(target, extra) {
   target.startedAt = Math.min(target.startedAt, extra.startedAt)
@@ -611,6 +858,11 @@ export function mergeStats(target, extra) {
     mergeLedgerInto(to.ledger, from.ledger)
   }
   mergeLedgerInto(target.ledger, extra.ledger)
+  for (const path of Object.keys(extra.mergedShards || {})) {
+    if (!target.mergedShards) target.mergedShards = {}
+    if (!target.mergedShards[path]) target.mergedShards[path] = extra.mergedShards[path]
+  }
+  target.totals.perModel = normalizePerModel(target.totals.perModel)
   return target
 }
 
@@ -658,7 +910,9 @@ function statsFromRaw(raw, path) {
     baseline: raw.baseline || null,
     ledger: reviveLedger(raw.ledger),
     loadedFrom: path,
+    mergedShards: raw.mergedShards && typeof raw.mergedShards === 'object' ? raw.mergedShards : {},
   }
+  stats.totals.perModel = normalizePerModel(stats.totals.perModel)
   for (const key of Object.keys(raw.sessions || {})) {
     const session = { ...emptySession(), ...raw.sessions[key] }
     session.ledger = reviveLedger(raw.sessions[key] && raw.sessions[key].ledger)
@@ -673,16 +927,29 @@ function loadStats() {
     if (primary === null) return null
     const stats = statsFromRaw(primary.raw, primary.path)
     // 旧位置可能留下互补的分片（例如换启动目录后写到另一个盘根，或多个实例各写一份）：
-    // 副本忽略、其余合并，避免重复计数。
+    // 已消费过的（mergedShards）、副本、以及内容已被主文件包含的旧快照都跳过，避免重复计数。
     const others = candidateStatsPaths()
       .map((path) => {
         const found = readOneStatsFile(path)
         if (found === null) return null
-        return { path: found.path, raw: found.raw, sessions: found.raw.sessions || {} }
+        return { path: found.path, raw: found.raw, sessions: found.raw.sessions || {}, size: found.size, mtimeMs: found.mtimeMs }
       })
       .filter((item) => item !== null)
-    const merged = planLegacyMerge({ path: primary.path, sessions: stats.sessions }, others)
-    for (const item of merged) mergeStats(stats, statsFromRaw(item.raw, item.path))
+    const merged = planLegacyMerge({ path: primary.path, sessions: stats.sessions }, others, stats.mergedShards)
+    for (const item of merged) {
+      const shardStats = statsFromRaw(item.raw, item.path)
+      mergeStats(stats, shardStats)
+      recordConsumedShard(stats, item.path, { merged: true, calls: shardStats.totals.calls || 0 })
+    }
+    // 未合并的旧文件也登记一次（副本/已被包含/已消费），后续启动不再重复判断
+    for (const item of others) {
+      if (item.path === primary.path) continue
+      if (stats.mergedShards[item.path]) continue
+      recordConsumedShard(stats, item.path, {
+        merged: false,
+        reason: isDuplicateShard(stats.sessions, item.sessions) ? 'duplicate' : 'overlap',
+      })
+    }
     stats.mergedFrom = merged.map((item) => item.path)
     return stats
   } catch {
@@ -690,14 +957,28 @@ function loadStats() {
   }
 }
 
+let saveErrorLogged = false
+
 function saveStats(stats) {
   try {
     mkdirSync(dirname(DATA_FILE), { recursive: true })
     const tmp = DATA_FILE + '.tmp'
     writeFileSync(tmp, JSON.stringify(stats))
+    // 覆盖前留一份上一版，JSON 损坏/误重置时还能找回
+    if (existsSync(DATA_FILE)) {
+      try {
+        copyFileSync(DATA_FILE, DATA_FILE + '.bak')
+      } catch {
+        // 备份失败不影响主写入
+      }
+    }
     renameSync(tmp, DATA_FILE)
-  } catch {
-    // 忽略持久化失败（只影响重启后的恢复）
+    saveErrorLogged = false
+  } catch (error) {
+    if (!saveErrorLogged) {
+      saveErrorLogged = true
+      console.warn('[dsh-balance-and-cost] 统计保存失败（本次运行仍会继续统计，重启后可能丢失）: ' + String((error && error.message) || error))
+    }
   }
 }
 
@@ -706,6 +987,7 @@ function sendJson(res, value, status = 200) {
   res.writeHead(status, {
     'Content-Type': 'application/json; charset=utf-8',
     'Cache-Control': 'no-store',
+    'X-Content-Type-Options': 'nosniff',
   })
   res.end(body)
 }
@@ -746,7 +1028,11 @@ export function tokensFromRow(row) {
 //   按当前单价权重分摊（仅是拆分近似，**合计始终等于记录的真实费用**），并标记 approximate。
 // date 只参与残差权重，不参与已记录部分——这就是「价格不再突变」的关键。
 export function scopeBreakdown(tokens, recordedCostCny, ledger, model, date) {
-  const led = ledgerTotals(ledger, model)
+  return breakdownFromLedger(tokens, recordedCostCny, ledgerTotals(ledger, model), model, date)
+}
+
+// 用一份已经取好的计价缓存合计做三档拆分（totals 汇总时按模型族各取一次，避免重复计入）
+function breakdownFromLedger(tokens, recordedCostCny, led, model, date) {
   const residueMiss = Math.max(0, tokens.miss - led.missTokens)
   const residueHit = Math.max(0, tokens.hit - led.hitTokens)
   const residueOut = Math.max(0, tokens.out - led.outputTokens)
@@ -793,7 +1079,25 @@ export function scopeBreakdown(tokens, recordedCostCny, ledger, model, date) {
   }
 }
 
-// 全局总计的三档汇总：每个模型各自读自己的计价缓存（旧数据用各自单价分摊残差）后相加，
+const EMPTY_LEDGER_TOTALS = {
+  calls: 0, missTokens: 0, hitTokens: 0, outputTokens: 0,
+  missCostCny: 0, hitCostCny: 0, outputCostCny: 0, totalCostCny: 0,
+  hours: 0, peakTokens: 0, offTokens: 0, firstAt: null, lastAt: null, estimated: false,
+}
+
+// 每个归一化模型一份 ledger 合计（同族新旧 key 只算一次）
+function ledgerByModel(ledger) {
+  const names = new Set()
+  for (const key of Object.keys((ledger && ledger.buckets) || {})) {
+    for (const name of Object.keys(ledger.buckets[key].models || {})) names.add(normalizeModel(name))
+  }
+  for (const name of Object.keys((ledger && ledger.settled) || {})) names.add(normalizeModel(name))
+  const map = new Map()
+  for (const name of names) map.set(name, ledgerTotals(ledger, name))
+  return map
+}
+
+// 全局总计的三档汇总：每个模型族各取一次自己的计价缓存（旧数据用各自单价分摊残差）后相加，
 // 再按 totals.costCny（逐次调用冻结的真实费用之和）归一。
 function totalsBreakdown(stats, date) {
   let miss = 0
@@ -804,9 +1108,15 @@ function totalsBreakdown(stats, date) {
   let outC = 0
   let residue = 0
   let approximate = false
+  const ledMap = ledgerByModel(stats.ledger)
+  const used = new Set()
   for (const key of Object.keys(stats.totals.perModel)) {
     const r = stats.totals.perModel[key]
-    const b = scopeBreakdown(tokensFromRow(r), r.costCny || 0, stats.ledger, r.model, date)
+    const family = normalizeModel(r.model)
+    // 同一模型族只把 ledger 计入一次（不同 provider 也可能用同一模型名）
+    const led = used.has(family) ? EMPTY_LEDGER_TOTALS : (ledMap.get(family) || EMPTY_LEDGER_TOTALS)
+    used.add(family)
+    const b = breakdownFromLedger(tokensFromRow(r), r.costCny || 0, led, r.model, date)
     miss += b.missTokens
     hit += b.hitTokens
     out += b.outputTokens
@@ -819,9 +1129,6 @@ function totalsBreakdown(stats, date) {
   const rawSum = missC + hitC + outC
   const target = stats.totals.costCny || 0
   const k = rawSum > 0 ? target / rawSum : 0
-  // 计价缓存部分统一取全局 ledger 口径：按 per-model 行累加会在同一模型族有多行
-  // （deepseek-v4-flash 旧名 + deepseek-flash 新名）时重复计数。
-  // 同时据此判断是否含「无时间记录」的历史 token。
   const ledAll = ledgerTotals(stats.ledger, null)
   const ledTokens = ledAll.missTokens + ledAll.hitTokens + ledAll.outputTokens
   const tokenTotal = miss + hit + out
@@ -840,14 +1147,46 @@ function totalsBreakdown(stats, date) {
   }
 }
 
+// 定价配置文件：默认 $DSH_HOME/dsh-balance-and-cost.pricing.json，可用 DSH_BALANCE_AND_COST_PRICING 指定。
+// 只影响之后的消耗；历史费用仍以计价缓存里冻结的单价为准。
+function pricingConfigPath() {
+  const explicit = (process.env.DSH_BALANCE_AND_COST_PRICING || '').trim()
+  return explicit || join(DSH_HOME_DIR, 'dsh-balance-and-cost.pricing.json')
+}
+
+function loadPricingOverrides() {
+  const path = pricingConfigPath()
+  if (!existsSync(path)) return { applied: false, path, errors: [], priceChanged: false }
+  try {
+    const raw = JSON.parse(readFileSync(path, 'utf8'))
+    const result = configurePricing(raw, { source: path })
+    return { ...result, path }
+  } catch (error) {
+    return { applied: false, path, errors: [String((error && error.message) || error)], priceChanged: false }
+  }
+}
+
 export function apply(ctx) {
-  const stats = loadStats() || { startedAt: Date.now(), totals: emptyTotals(), sessions: {}, baseline: null, ledger: emptyLedger() }
+  // 供应商白名单可先用环境变量给，再被定价配置文件覆盖
+  const envProviders = (process.env.DSH_BALANCE_AND_COST_PROVIDERS || '').trim()
+  if (envProviders) {
+    configurePricing({ providers: envProviders.split(',').map((p) => p.trim()).filter((p) => p.length > 0) }, { source: 'env' })
+  }
+  const pricingConfig = loadPricingOverrides()
+  const stats = loadStats() || { startedAt: Date.now(), totals: emptyTotals(), sessions: {}, baseline: null, ledger: emptyLedger(), mergedShards: {} }
   if (!stats.ledger) stats.ledger = emptyLedger()
-  // 价格表版本变化 → 按各分桶记录的时间用新表重算一次（时间不变，只换表）
-  const repriced = repriceLedger(stats)
+  if (!stats.mergedShards) stats.mergedShards = {}
+  // 会话标题短期缓存：轮询/SSE 刷新很频繁，标题却几乎不变
+  const titleCache = new Map()
+  const TITLE_CACHE_MS = 30000
+  // 价格表版本变化 → 按各分桶记录的时间用新表重算一次（时间不变，只换表）。
+  // 用户用定价配置文件改了价格/窗口/节假日时跳过：配置只影响之后的消耗，历史费用保持冻结。
+  const repriced = pricingConfig.priceChanged ? false : repriceLedger(stats)
   // 统计文件迁移到 $DSH_HOME（旧位置见 LEGACY_DATA_FILES），分片互补时已合并
   const migrated = stats.loadedFrom !== undefined && stats.loadedFrom !== DATA_FILE
-  if (repriced || migrated) saveStats(stats)
+  // 迁移来源本身也要登记为「已消费」，否则旧文件会在之后的每次启动被当成新分片再次合并
+  if (migrated && stats.loadedFrom) recordConsumedShard(stats, stats.loadedFrom, { migrated: true })
+  if (repriced || migrated || (stats.mergedFrom && stats.mergedFrom.length > 0)) saveStats(stats)
   let saveTimer = null
   const scheduleSave = () => {
     if (saveTimer !== null) return
@@ -885,18 +1224,22 @@ export function apply(ctx) {
       }
     }
   }, 30000)
-  // 会话模型选择变化（用户切换模型）→ 即时推送
-  ctx.on('settings/updated', (ns) => {
-    if (String(ns) === 'agent-default-model') sseBroadcast({ type: 'selection' })
+  // 模型选择变化（用户切换模型）→ 即时推送。DSH 0.2.x 的事件名是 settings/document-updated，
+  // 旧的 settings/updated 已不存在（监听它会静默失效，只能靠 15s 轮询兜底）。
+  ctx.on('settings/document-updated', (ns) => {
+    if (String(ns || '') === 'agent-default-model') sseBroadcast({ type: 'selection' })
   })
 
   // 统计 DeepSeek 路由的每次模型调用：总计 + 按会话；费用按调用时刻的时段计价
   ctx.on('llm/stream', (options, next) => {
     const stream = next()
     const provider = String((options && options.provider) || '')
-    if (provider.toLowerCase().indexOf('deepseek') === -1) return stream
+    if (!isMeteredProvider(provider)) return stream
     const model = String((options && options.model) || 'unknown')
     const sid = options && options.sessionId ? String(options.sessionId) : null
+    // 计费时刻取「请求发起时刻」而不是 usage chunk 到达时刻：流式请求可能跨 12:00/18:00，
+    // 官方按请求发生的时间段计价，跨时段的调用不能按结束时刻算。
+    const requestAt = new Date()
     return (async function* () {
       for await (const chunk of stream) {
         if (chunk && chunk.type === 'usage' && chunk.usage) {
@@ -906,9 +1249,7 @@ export function apply(ctx) {
           const cr = u.cacheReadTokens || 0
           const cw = u.cacheWriteTokens || 0
           const rt = u.reasoningTokens || 0
-          // 计价缓存的写入时刻 = 消耗发生的具体时间：单价按这一刻判定并冻结，
-          // 返回的 cost 就是这次消耗的真实花费（之后任何时段变化都不会改动它）
-          const at = new Date()
+          const at = requestAt
           const price = priceFor(model, at)
           const normModel = normalizeModel(model)
           const cost = ledgerAdd(stats.ledger, normModel, at, { inputTokens: i, outputTokens: o, cacheReadTokens: cr, cacheWriteTokens: cw }, price)
@@ -919,19 +1260,24 @@ export function apply(ctx) {
           stats.totals.cacheWriteTokens += cw
           stats.totals.reasoningTokens += rt
           stats.totals.costCny += cost
-          if (price.estimated) stats.totals.anyEstimated = true
-          const key = provider + ':' + model
+          // perModel 以「provider:归一化模型名」为 key：升级前后的旧名不会再分裂成两行，
+          // estimated 每次写入都按当前价目表刷新（不再永久粘住旧标记）。
+          const key = provider + ':' + normModel
           let row = stats.totals.perModel[key]
           if (!row) {
-            row = { provider, model, calls: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, costCny: 0, estimated: price.estimated }
+            row = { provider, model: normModel, calls: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, costCny: 0, estimated: false }
             stats.totals.perModel[key] = row
           }
+          row.provider = provider
+          row.model = normModel
+          row.estimated = !!price.estimated
           row.calls += 1
           row.inputTokens += i
           row.outputTokens += o
           row.cacheReadTokens += cr
           row.cacheWriteTokens += cw
           row.costCny += cost
+          stats.totals.anyEstimated = Object.keys(stats.totals.perModel).some((k) => !!stats.totals.perModel[k].estimated)
           if (sid) {
             let s = stats.sessions[sid]
             if (!s) {
@@ -970,33 +1316,155 @@ export function apply(ctx) {
     })()
   })
 
-  // 查询 DeepSeek 余额（Node 内置 fetch；Key 经 credentials 服务解析）
-  async function fetchBalance() {
+  // ── 余额 ──────────────────────────────────────────────────────────────────
+  // 优先走 DSH 官方账号服务（deepseekAccount，账号登录用户没有 API Key），
+  // 未登录/失败时再回退 API Key + 官方 /user/balance。两种来源都返回多钱包/多币种。
+
+  function accountClientMeta() {
+    return {
+      version: '0.4.0',
+      locale: 'zh_CN',
+      timezoneOffsetSeconds: -new Date().getTimezoneOffset() * 60,
+    }
+  }
+
+  // 把「充值钱包 + 赠送钱包」按币种合并：total = toppedUp + granted
+  function walletSummary(recharge, bonus) {
+    const byCurrency = new Map()
+    const ensure = (currency) => {
+      const key = String(currency || '')
+      let item = byCurrency.get(key)
+      if (!item) {
+        item = { currency: key, toppedUp: 0, granted: 0, total: 0 }
+        byCurrency.set(key, item)
+      }
+      return item
+    }
+    for (const wallet of recharge || []) {
+      if (!wallet || typeof wallet.currency !== 'string') continue
+      const item = ensure(wallet.currency)
+      item.toppedUp += Number(wallet.balance) || 0
+    }
+    for (const wallet of bonus || []) {
+      if (!wallet || typeof wallet.currency !== 'string') continue
+      const item = ensure(wallet.currency)
+      item.granted += Number(wallet.balance) || 0
+    }
+    for (const item of byCurrency.values()) item.total = item.toppedUp + item.granted
+    return [...byCurrency.values()]
+  }
+
+  // 主展示钱包：优先 CNY，其次第一个
+  function pickWallet(wallets) {
+    return (wallets || []).find((w) => w.currency === 'CNY') || (wallets || [])[0] || null
+  }
+
+  function balanceResult(source, isAvailable, wallets) {
+    const primary = pickWallet(wallets)
+    if (!primary) return { ok: false, source, error: '余额响应为空' }
+    return {
+      ok: true,
+      source,
+      isAvailable: !!isAvailable,
+      currency: primary.currency,
+      totalBalance: primary.total,
+      grantedBalance: primary.granted,
+      toppedUpBalance: primary.toppedUp,
+      wallets,
+    }
+  }
+
+  async function fetchAccountBalance() {
+    const account = ctx.get('deepseekAccount')
+    if (!account || typeof account.getBalance !== 'function') return null
+    let result
+    try {
+      result = await account.getBalance(accountClientMeta())
+    } catch (e) {
+      return { ok: false, source: 'account', error: '账号余额查询失败：' + String((e && e.message) || e) }
+    }
+    if (result === null || result === undefined) return null // 未登录 → 回退 API Key
+    if (result.status !== 'ready') return { ok: false, source: 'account', error: '账号余额查询失败' }
+    const wallets = walletSummary(result.value, result.bonusWallets)
+    return balanceResult('account', true, wallets)
+  }
+
+  // 余额接口地址：默认官方；网关/中转可用 DSH_BALANCE_AND_COST_BASE_URL 覆盖
+  function balanceEndpoint() {
+    const raw = (process.env.DSH_BALANCE_AND_COST_BASE_URL || '').trim() || 'https://api.deepseek.com'
+    try {
+      return new URL('/user/balance', new URL(raw).origin).href
+    } catch {
+      return 'https://api.deepseek.com/user/balance'
+    }
+  }
+
+  async function fetchApiKeyBalance() {
     const credentials = ctx.get('credentials')
-    if (credentials === undefined) return { ok: false, error: 'credentials 服务不可用' }
-    const cred = await credentials.resolve('DEEPSEEK_API_KEY')
-    if (!cred || !cred.value) return { ok: false, error: '未配置 DEEPSEEK_API_KEY（请在 ~/.dsh/.credentials.yaml 中设置）' }
+    if (credentials === undefined) return { ok: false, source: 'api-key', error: 'credentials 服务不可用' }
+    // 默认 DEEPSEEK_API_KEY；用户改过 apiKeyEnv 时可用 DSH_BALANCE_AND_COST_API_KEY_ENV 指定
+    const refs = []
+    const envRef = (process.env.DSH_BALANCE_AND_COST_API_KEY_ENV || '').trim()
+    if (envRef) refs.push(envRef)
+    refs.push('DEEPSEEK_API_KEY')
+    let cred = null
+    let lastError = null
+    for (const ref of [...new Set(refs)]) {
+      try {
+        const found = await credentials.resolve(ref)
+        if (found && found.value) {
+          cred = found
+          break
+        }
+      } catch (e) {
+        lastError = e
+      }
+    }
+    if (cred === null) {
+      if (lastError) return { ok: false, source: 'api-key', error: '读取凭据失败：' + String((lastError && lastError.message) || lastError) }
+      return { ok: false, source: 'api-key', error: '未配置 DEEPSEEK_API_KEY（可在 ~/.dsh/.credentials.yaml 或环境变量中设置）' }
+    }
     let json
     try {
-      const res = await fetch('https://api.deepseek.com/user/balance', {
+      const res = await fetch(balanceEndpoint(), {
         headers: { Authorization: 'Bearer ' + cred.value },
         signal: AbortSignal.timeout(15000),
       })
-      if (!res.ok) return { ok: false, error: '余额接口 HTTP ' + res.status }
+      if (!res.ok) return { ok: false, source: 'api-key', error: '余额接口 HTTP ' + res.status }
       json = await res.json()
     } catch (e) {
-      return { ok: false, error: '余额查询失败：' + String((e && e.message) || e) }
+      return { ok: false, source: 'api-key', error: '余额查询失败：' + String((e && e.message) || e) }
     }
-    const info = Array.isArray(json.balance_infos) ? json.balance_infos[0] : undefined
-    if (!info) return { ok: false, error: '响应缺少 balance_infos' }
-    return {
-      ok: true,
-      isAvailable: !!json.is_available,
-      currency: String(info.currency || ''),
-      totalBalance: Number(info.total_balance),
-      grantedBalance: Number(info.granted_balance),
-      toppedUpBalance: Number(info.topped_up_balance),
-    }
+    const infos = Array.isArray(json && json.balance_infos) ? json.balance_infos : []
+    // 官方允许同时返回 CNY / USD 等多个钱包，逐个保留而不是只取第一个
+    const wallets = infos
+      .filter((info) => info && typeof info.currency === 'string')
+      .map((info) => ({
+        currency: String(info.currency),
+        total: Number(info.total_balance),
+        granted: Number(info.granted_balance) || 0,
+        toppedUp: Number(info.topped_up_balance) || 0,
+      }))
+      .filter((wallet) => Number.isFinite(wallet.total))
+    if (wallets.length === 0) return { ok: false, source: 'api-key', error: '响应缺少 balance_infos' }
+    return balanceResult('api-key', json.is_available, wallets)
+  }
+
+  async function fetchBalance() {
+    const account = await fetchAccountBalance()
+    if (account && account.ok) return account
+    const apiKey = await fetchApiKeyBalance()
+    if (apiKey.ok) return apiKey
+    // 账号已登录但查询失败时，优先展示账号的错误（更贴近用户当前状态）
+    return account || apiKey
+  }
+
+  // 余额基线：按币种分别记录（首次成功查询时建立）
+  function baselineWallets(baseline) {
+    if (!baseline) return {}
+    if (baseline.wallets && typeof baseline.wallets === 'object') return baseline.wallets
+    if (baseline.currency && typeof baseline.totalBalance === 'number') return { [baseline.currency]: baseline.totalBalance }
+    return {}
   }
 
   // 余额查询 60 秒缓存
@@ -1006,7 +1474,12 @@ export function apply(ctx) {
     if (balanceCache.value && now - balanceCache.at < BALANCE_CACHE_MS) return balanceCache.value
     const result = await fetchBalance()
     if (result.ok && stats.baseline === null) {
-      stats.baseline = { totalBalance: result.totalBalance, currency: result.currency }
+      stats.baseline = {
+        at: Date.now(),
+        currency: result.currency,
+        totalBalance: result.totalBalance,
+        wallets: Object.fromEntries((result.wallets || []).map((w) => [w.currency, w.total])),
+      }
       scheduleSave()
     }
     balanceCache = { at: now, value: result }
@@ -1033,48 +1506,78 @@ export function apply(ctx) {
       const r = stats.totals.perModel[key]
       return { provider: r.provider, model: r.model, calls: r.calls, inputTokens: r.inputTokens, outputTokens: r.outputTokens, cacheReadTokens: r.cacheReadTokens, cacheWriteTokens: r.cacheWriteTokens, costCny: r.costCny, estimated: r.estimated }
     })
-    // 会话标题（sessionQuery.readTitle，读取失败或未命名则回退 null）
+    // 会话标题：优先用 readTitleSnapshots 批量读，失败再逐个 readTitle；带 30s 缓存，
+    // 避免 15s 轮询 / SSE 刷新把几十个会话日志重复读一遍。
     const sessionQueryService = ctx.get('sessionQuery')
+    const sessionIds = Object.keys(stats.sessions)
     const titleOf = async (id) => {
       if (!sessionQueryService || typeof sessionQueryService.readTitle !== 'function') return null
+      const cached = titleCache.get(id)
+      if (cached && Date.now() - cached.at < TITLE_CACHE_MS) return cached.title
       try {
         const t = await sessionQueryService.readTitle(id)
-        return t && t.title ? String(t.title) : null
+        const title = t && t.title ? String(t.title) : null
+        titleCache.set(id, { title, at: Date.now() })
+        return title
       } catch {
         return null
       }
     }
-    const sessions = []
-    for (const id of Object.keys(stats.sessions)) {
-      const s = stats.sessions[id]
-      // 分模型明细：价格表内模型（flash/pro）+ 该会话实际用过的所有模型；
-      // 聚合精确与全部前缀 key（兼容历史 key 分裂）；未调用模型给 0 占位。
-      const sessionModelKeys = new Set([...Object.keys(PRICES), ...Object.keys(s.models), ...Object.keys(s.modelsTok || {})])
-      const modelsDetail = []
-      for (const m of sessionModelKeys) {
-        let calls = 0
-        let tokens = 0
-        let costCny = 0
-        for (const k of Object.keys(s.models)) {
-          if (modelMatches(k, m)) calls += s.models[k] || 0
+    const titles = new Map()
+    let batchTitles = false
+    if (sessionQueryService && typeof sessionQueryService.readTitleSnapshots === 'function' && sessionIds.length > 0) {
+      try {
+        const batch = await sessionQueryService.readTitleSnapshots(sessionIds)
+        batchTitles = true
+        for (const item of batch || []) {
+          const id = String(item && item.sessionId)
+          const title = item && item.status === 'fulfilled' && item.value && item.value.title && item.value.title.title
+            ? String(item.value.title.title)
+            : null
+          titles.set(id, title)
+          titleCache.set(id, { title, at: Date.now() })
         }
-        for (const k of Object.keys(s.modelsTok || {})) {
-          if (modelMatches(k, m)) {
-            const t = s.modelsTok[k]
-            tokens += (t.inputTokens || 0) + (t.outputTokens || 0) + (t.cacheReadTokens || 0) + (t.cacheWriteTokens || 0)
-            costCny += t.costCny || 0
-          }
-        }
-        modelsDetail.push({ model: m, calls, tokens, costCny })
+      } catch {
+        batchTitles = false
       }
+    }
+    const sessions = []
+    for (const id of sessionIds) {
+      const s = stats.sessions[id]
+      // 分模型明细：先按归一化模型聚合（旧 key deepseek-v4-flash 与新 key deepseek-flash 合并），
+      // 再补上价目表内未调用的模型占位。同一模型只输出一行。
+      const agg = new Map()
+      const bump = (model) => {
+        let item = agg.get(model)
+        if (!item) {
+          item = { calls: 0, tokens: 0, costCny: 0 }
+          agg.set(model, item)
+        }
+        return item
+      }
+      for (const k of Object.keys(s.models || {})) {
+        bump(normalizeModel(k)).calls += s.models[k] || 0
+      }
+      for (const k of Object.keys(s.modelsTok || {})) {
+        const t = s.modelsTok[k]
+        const item = bump(normalizeModel(k))
+        item.tokens += (t.inputTokens || 0) + (t.outputTokens || 0) + (t.cacheReadTokens || 0) + (t.cacheWriteTokens || 0)
+        item.costCny += t.costCny || 0
+      }
+      const sessionModelKeys = new Set([...Object.keys(PRICES), ...agg.keys()])
+      const modelsDetail = [...sessionModelKeys].map((model) => ({ model, ...(agg.get(model) || { calls: 0, tokens: 0, costCny: 0 }) }))
       modelsDetail.sort((a, b) => {
         if (a.calls !== b.calls) return b.calls - a.calls
         if (a.tokens !== b.tokens) return b.tokens - a.tokens
         return a.model < b.model ? -1 : 1
       })
+      const modelList = [...agg.entries()]
+        .filter(([, v]) => v.calls > 0)
+        .sort((a, b) => b[1].calls - a[1].calls)
+        .map(([model]) => model)
       sessions.push({
         sessionId: id,
-        title: await titleOf(id),
+        title: batchTitles ? (titles.get(id) || null) : await titleOf(id),
         calls: s.calls,
         inputTokens: s.inputTokens,
         outputTokens: s.outputTokens,
@@ -1082,13 +1585,15 @@ export function apply(ctx) {
         cacheWriteTokens: s.cacheWriteTokens,
         reasoningTokens: s.reasoningTokens,
         costCny: s.costCny,
-        models: Object.keys(s.models).sort((a, b) => (s.models[b] || 0) - (s.models[a] || 0)),
+        models: modelList,
         modelsDetail,
       })
     }
-    sessions.sort((a, b) => (b.inputTokens + b.outputTokens) - (a.inputTokens + a.outputTokens))
+    // 按总 token（含缓存读写）排序：只算 input+output 会严重低估缓存命中型会话
+    const totalTokensOf = (s) => (s.inputTokens || 0) + (s.outputTokens || 0) + (s.cacheReadTokens || 0) + (s.cacheWriteTokens || 0)
+    sessions.sort((a, b) => totalTokensOf(b) - totalTokensOf(a))
     const totals = rowView(stats.totals)
-    totals.anyEstimated = stats.totals.anyEstimated
+    totals.anyEstimated = Object.keys(stats.totals.perModel).some((key) => !!stats.totals.perModel[key].estimated)
     totals.perModel = perModel
     // 会话当前选中的模型：优先读该会话最近的请求配置（会话日志 requestHeader，
     // 持久化、按会话隔离——切到哪个对话框就显示哪个），否则回退全局默认。
@@ -1133,7 +1638,7 @@ export function apply(ctx) {
     current.modelsActual = Object.keys(PRICES)
       .map((m) => {
         const v = modelTokens(m)
-        return { model: m, tokens: v.tokens, costCny: v.costCny, selected: selectedModel !== null && m === selectedModel.model }
+        return { model: m, tokens: v.tokens, costCny: v.costCny, selected: selectedModel !== null && normalizeModel(m) === normalizeModel(selectedModel.model) }
       })
       .sort((a, b) => {
         if (a.selected !== b.selected) return a.selected ? -1 : 1
@@ -1165,9 +1670,16 @@ export function apply(ctx) {
     const pricing = ledgerView(stats.ledger, null)
     pricing.currentSession = sid ? ledgerView(currentRow.ledger, null) : null
     pricing.maxBuckets = LEDGER_MAX_BUCKETS
-    // 当前生效的官方价格表信息（供界面标注与审计）
+    // 当前生效的价格表信息（供界面标注与审计）
     pricing.table = {
       ...PRICING_INFO,
+      providers: [...METERED_PROVIDERS],
+      holidays: HOLIDAYS.size,
+      config: {
+        path: pricingConfig.path,
+        applied: !!pricingConfig.applied,
+        errors: pricingConfig.errors || [],
+      },
       models: Object.keys(PRICES).map((key) => ({
         model: key,
         inputMiss: PRICES[key].inputMiss,
@@ -1188,8 +1700,79 @@ export function apply(ctx) {
   }
 
   const disposers = []
-  if (ctx.webServer !== undefined) {
-    disposers.push(ctx.webServer.register({
+  let routeErrorLogged = false
+  const logRouteError = (path, error) => {
+    if (routeErrorLogged) return
+    routeErrorLogged = true
+    console.warn('[dsh-balance-and-cost] ' + path + ' 处理失败: ' + String((error && error.stack) || error))
+  }
+  // 每个进程一份 CSRF token：由 /usage 下发给同源页面（跨站读不到响应），/reset 必须带上它。
+  const csrfToken = randomUUID()
+
+  // webServer 是可选依赖：headless/CLI 组合没有它，插件仍然统计用量；Web 组合里再挂路由。
+  const registerRoutes = (webServer) => {
+    // 服务被替换/重载时先清掉旧路由，避免重复注册抛错（也保证不会叠出两套端点）
+    for (const dispose of disposers.splice(0)) {
+      try {
+        dispose()
+      } catch {
+        // 忽略旧路由释放异常
+      }
+    }
+    // Host 白名单：回环 + DSH 实际监听的 host + 私有网段（LAN 访问）+ 显式白名单。
+    // 目的是挡住 DNS rebinding（攻击者域名解析到 127.0.0.1），同时不破坏远程访问。
+    const hostNames = new Set(['127.0.0.1', 'localhost', '::1', '[::1]'])
+    const hostPorts = new Set()
+    for (const extra of (process.env.DSH_BALANCE_AND_COST_ALLOWED_HOSTS || '').split(',')) {
+      const value = extra.trim().toLowerCase()
+      if (value) hostNames.add(value)
+    }
+    try {
+      const origin = new URL(webServer.getOrigin())
+      hostNames.add(origin.hostname.toLowerCase())
+      hostPorts.add(origin.host.toLowerCase())
+    } catch {
+      // getOrigin 在 listen 之前会抛错，回退到回环白名单
+    }
+    const isPrivateHost = (name) => {
+      const bare = name.replace(/^\[|\]$/g, '')
+      if (/^10\./.test(bare) || /^192\.168\./.test(bare) || /^169\.254\./.test(bare)) return true
+      if (/^172\.(1[6-9]|2\d|3[01])\./.test(bare)) return true
+      if (/^(fc|fd|fe80)/i.test(bare)) return true
+      return false
+    }
+    const hostAllowed = (req) => {
+      const host = String((req.headers && req.headers.host) || '').toLowerCase()
+      if (!host) return false
+      if (hostPorts.has(host)) return true
+      const name = host.startsWith('[') ? host.slice(0, host.indexOf(']') + 1) : host.split(':')[0]
+      return hostNames.has(name) || isPrivateHost(name)
+    }
+    // 同源校验只对带 Origin 的浏览器请求生效（curl/本地进程没有 Origin）
+    const sameOrigin = (req) => {
+      const origin = req.headers && req.headers.origin
+      if (!origin) return true
+      try {
+        const parsed = new URL(origin)
+        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false
+        return parsed.host.toLowerCase() === String(req.headers.host || '').toLowerCase()
+      } catch {
+        return false
+      }
+    }
+    const guard = (req, res, needSameOrigin) => {
+      if (!hostAllowed(req)) {
+        sendJson(res, { ok: false, error: 'forbidden host' }, 403)
+        return false
+      }
+      if (needSameOrigin && !sameOrigin(req)) {
+        sendJson(res, { ok: false, error: 'forbidden origin' }, 403)
+        return false
+      }
+      return true
+    }
+
+    disposers.push(webServer.register({
       kind: 'exact',
       path: '/__dsh-balance-and-cost/balance',
       handler: (req, res) => {
@@ -1197,12 +1780,13 @@ export function apply(ctx) {
           sendJson(res, { ok: false, error: 'method not allowed' }, 405)
           return
         }
+        if (!guard(req, res, false)) return
         getBalanceCached().then((value) => sendJson(res, value)).catch((e) => {
           sendJson(res, { ok: false, error: String((e && e.message) || e) })
         })
       },
     }))
-    disposers.push(ctx.webServer.register({
+    disposers.push(webServer.register({
       kind: 'exact',
       path: '/__dsh-balance-and-cost/usage',
       handler: (req, res) => {
@@ -1210,13 +1794,17 @@ export function apply(ctx) {
           sendJson(res, { ok: false, error: 'method not allowed' }, 405)
           return
         }
+        if (!guard(req, res, false)) return
         const url = new URL(req.url || '/', 'http://localhost')
-        usageSnapshot(url.searchParams.get('sessionId')).then((value) => sendJson(res, value)).catch((e) => {
+        usageSnapshot(url.searchParams.get('sessionId')).then((value) => {
+          sendJson(res, { ...value, csrfToken })
+        }).catch((e) => {
+          logRouteError('/usage', e)
           sendJson(res, { ok: false, error: String((e && e.message) || e) })
         })
       },
     }))
-    disposers.push(ctx.webServer.register({
+    disposers.push(webServer.register({
       kind: 'exact',
       path: '/__dsh-balance-and-cost/reset',
       handler: (req, res) => {
@@ -1224,31 +1812,54 @@ export function apply(ctx) {
           sendJson(res, { ok: false, error: 'method not allowed' }, 405)
           return
         }
+        // 重置是破坏性操作：必须同源 + 带 /usage 下发的 token（防 CSRF）
+        if (!guard(req, res, true)) return
+        const token = String((req.headers && req.headers['x-dsh-balance-token']) || '')
+        if (token !== csrfToken) {
+          sendJson(res, { ok: false, error: 'invalid csrf token' }, 403)
+          return
+        }
         stats.totals = emptyTotals()
         stats.sessions = {}
         stats.baseline = null
         stats.startedAt = Date.now()
         stats.ledger = emptyLedger()
+        // mergedShards 保留：已经消费过的旧分片不能在重置后被重新合并回来
         balanceCache = { at: 0, value: null }
+        titleCache.clear()
         saveStats(stats)
         sseBroadcast({ type: 'usage' })
         sendJson(res, { ok: true })
       },
     }))
-    disposers.push(ctx.webServer.register({
+    disposers.push(webServer.register({
       kind: 'exact',
       path: '/__dsh-balance-and-cost/events',
       handler: (req, res) => {
+        if (req.method !== 'GET') {
+          sendJson(res, { ok: false, error: 'method not allowed' }, 405)
+          return
+        }
+        if (!guard(req, res, true)) return
         res.writeHead(200, {
           'Content-Type': 'text/event-stream',
           'Cache-Control': 'no-cache',
           Connection: 'keep-alive',
+          'X-Content-Type-Options': 'nosniff',
         })
         res.write('retry: 5000\n\n')
         sseClients.add(res)
         req.on('close', () => sseClients.delete(res))
       },
     }))
+    console.log('[dsh-balance-and-cost] HTTP 端点已注册（余额 / 用量 / 重置 / SSE）')
+  }
+
+  if (typeof ctx.inject === 'function') {
+    ctx.inject(['webServer'], (webCtx) => registerRoutes(webCtx.webServer))
+  } else {
+    const fallbackWebServer = ctx.webServer !== undefined ? ctx.webServer : (typeof ctx.get === 'function' ? ctx.get('webServer') : undefined)
+    if (fallbackWebServer !== undefined && fallbackWebServer !== null) registerRoutes(fallbackWebServer)
   }
 
   ctx.on('dispose', () => {
@@ -1275,6 +1886,8 @@ export function apply(ctx) {
     }
   })
 
-  console.log('[dsh-balance-and-cost] 已激活：llm/stream 统计 + 余额/用量路由；统计文件 ' + DATA_FILE
-    + (migrated ? '（已从 ' + stats.loadedFrom + ' 迁移' + ((stats.mergedFrom && stats.mergedFrom.length) ? '，并合并 ' + stats.mergedFrom.join('、') : '') + '）' : ''))
+  console.log('[dsh-balance-and-cost] 已激活：llm/stream 统计；统计文件 ' + DATA_FILE
+    + (migrated ? '（已从 ' + stats.loadedFrom + ' 迁移' + ((stats.mergedFrom && stats.mergedFrom.length) ? '，并合并 ' + stats.mergedFrom.join('、') : '') + '）' : '')
+    + (pricingConfig.applied ? '；价格表覆盖自 ' + pricingConfig.path : '')
+    + ((pricingConfig.errors && pricingConfig.errors.length) ? '；定价配置有误：' + pricingConfig.errors.join('；') : ''))
 }

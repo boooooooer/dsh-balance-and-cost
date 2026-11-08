@@ -68,7 +68,7 @@ assert.deepEqual(LEGACY_DATA_FILES, [legacyFile, legacyShard2], '显式指定的
 assert.deepEqual(candidateStatsPaths(), [newFile, legacyFile, legacyShard2], '迁移扫描顺序：新位置 → 旧位置')
 
 // 用最小假 ctx 挂载一次：只有 webServer 与 on 是必需的，其余服务缺席时应优雅降级
-function mount() {
+function mount(extraServices = {}) {
   const listeners = new Map()
   const routes = new Map()
   const ctx = {
@@ -76,6 +76,7 @@ function mount() {
       listeners.set(name, fn)
     },
     get(name) {
+      if (name in extraServices) return extraServices[name]
       if (name === 'agentDefaultModel') {
         return { currentSelection: () => ({ provider: 'deepseek-official', model: 'deepseek-v4-flash-0731' }) }
       }
@@ -89,7 +90,7 @@ function mount() {
     },
   }
   apply(ctx)
-  const getUsage = (sessionId) => new Promise((resolve, reject) => {
+  const request = (path, sessionId) => new Promise((resolve, reject) => {
     const res = {
       writeHead() {},
       end(body) {
@@ -100,13 +101,24 @@ function mount() {
         }
       },
     }
-    Promise.resolve(routes.get('/__dsh-balance-and-cost/usage')({ method: 'GET', url: '/__dsh-balance-and-cost/usage?sessionId=' + sessionId }, res)).catch(reject)
+    const url = path + (sessionId ? '?sessionId=' + sessionId : '')
+    Promise.resolve(routes.get(path)({ method: 'GET', url, headers: { host: '127.0.0.1:61530' } }, res)).catch(reject)
   })
-  const post = (path) => new Promise((resolve) => {
-    const res = { writeHead() {}, end: () => resolve() }
-    routes.get('/__dsh-balance-and-cost' + path)({ method: 'POST', url: path }, res)
+  const getUsage = (sessionId) => request('/__dsh-balance-and-cost/usage', sessionId)
+  const getBalance = () => request('/__dsh-balance-and-cost/balance')
+  const post = (path, token) => new Promise((resolve) => {
+    let status = 200
+    const res = {
+      writeHead(code) { status = code },
+      end(body) { resolve({ status, body: body ? JSON.parse(body) : null }) },
+    }
+    routes.get('/__dsh-balance-and-cost' + path)({
+      method: 'POST',
+      url: path,
+      headers: { host: '127.0.0.1:61530', 'x-dsh-balance-token': token || '' },
+    }, res)
   })
-  return { listeners, routes, ctx, getUsage, post }
+  return { listeners, routes, ctx, getUsage, getBalance, post }
 }
 
 // ── 1) 挂载：路由齐备；旧位置统计被迁移到 $DSH_HOME ──────────────────────────
@@ -120,6 +132,11 @@ assert.equal(migratedLoad.totals.calls, 8, '迁移后两个互补分片都被合
 assert.ok(Math.abs(migratedLoad.totals.costCny - 3.75) < 1e-9, '迁移后旧费用相加（1.5 + 2.25）')
 assert.equal(migratedLoad.sessions.length, 2, '两个分片的会话都在')
 assert.equal(migratedLoad.pricing.hours, 0, '旧数据没有时间记录 → 计价缓存为空')
+const oldSession = migratedLoad.sessions.find((s) => s.sessionId === 'old-session')
+assert.deepEqual(oldSession.modelsDetail.map((r) => r.model), ['deepseek-flash', 'deepseek-v4-pro'], '同族模型只输出一行，不再重复')
+assert.equal(oldSession.modelsDetail[0].calls, 3, '分模型明细使用旧 key 的调用次数')
+assert.equal(oldSession.modelsDetail[0].tokens, 1100, '旧 key 的 token 也归并到归一化模型')
+assert.deepEqual(migratedLoad.totals.perModel.map((r) => r.provider + ':' + r.model), ['deepseek-official:deepseek-flash'], 'perModel 同族合并为一行')
 
 // ── 2) 模拟一次 DeepSeek 调用（usage chunk 经 llm/stream 瀑布流）─────────────
 const stream = first.listeners.get('llm/stream')({ provider: 'deepseek-official', model: 'deepseek-v4-flash-0731', sessionId: 'session-test' }, () => (async function* () {
@@ -177,12 +194,41 @@ assert.ok(Math.abs(restored.totals.costCny - snapshot.totals.costCny) < 1e-9, '�
 assert.ok(Math.abs(restored.current.selectedBreakdown.totalCostCny - newCost) < 1e-9, '恢复后本会话费用不变')
 assert.equal(JSON.parse(readFileSync(newFile, 'utf8')).ledger.v, PRICING_VERSION, '恢复后仍标记当前价格表版本（不会重复重算）')
 
-// ── 6) 重置：清空计价缓存与统计 ─────────────────────────────────────────────
-await second.post('/reset')
+// ── 6) 重置：无 token 拒绝（防 CSRF），带 token 才清空 ───────────────────────
+const resetToken = (await second.getUsage('session-test')).csrfToken
+assert.ok(resetToken, '快照应下发 CSRF token')
+const forbidden = await second.post('/reset', 'wrong-token')
+assert.equal(forbidden.status, 403, '错误的 CSRF token 必须被拒绝')
+await second.post('/reset', resetToken)
 const afterReset = await second.getUsage('session-test')
 assert.equal(afterReset.pricing.hours, 0, '重置后计价缓存为空')
 assert.equal(afterReset.totals.costCny, 0)
 second.listeners.get('dispose')()
 
+// ── 7) 重启：已消费的旧分片不得再次合并（回归：每次启动重复计数）──────────────
+const third = mount()
+const afterRestart = await third.getUsage('session-test')
+assert.equal(afterRestart.totals.calls, 0, '重置后重启不得把旧分片重新合并回来')
+third.listeners.get('dispose')()
+
+// ── 8) 账号登录余额：多钱包/多币种（deepseekAccount 优先于 API Key）─────────────
+const accountMount = mount({
+  deepseekAccount: {
+    getBalance: async () => ({
+      status: 'ready',
+      value: [{ currency: 'CNY', balance: '1.50' }],
+      bonusWallets: [{ currency: 'CNY', balance: '0.50' }, { currency: 'USD', balance: '0.25' }],
+    }),
+  },
+})
+const accountBalance = await accountMount.getBalance()
+assert.equal(accountBalance.ok, true)
+assert.equal(accountBalance.source, 'account', '账号登录优先于 API Key')
+assert.equal(accountBalance.currency, 'CNY', '主展示币种为 CNY')
+assert.equal(accountBalance.totalBalance, 2, 'CNY 总余额 = 充值 1.50 + 赠送 0.50')
+assert.equal(accountBalance.wallets.length, 2, 'CNY / USD 两个钱包都保留')
+assert.equal(accountBalance.wallets.find((w) => w.currency === 'USD').total, 0.25)
+accountMount.listeners.get('dispose')()
+
 rmSync(sandbox, { recursive: true, force: true })
-console.log('integration OK: 旧文件迁移 / 路由 / llm/stream 统计 / 计价缓存贯通 / 持久化 / 重启恢复 / 重置')
+console.log('integration OK: 旧文件迁移 / 路由 / llm/stream 统计 / 计价缓存贯通 / 持久化 / 重启恢复 / 重置 / 分片只消费一次 / 账号余额多币种')

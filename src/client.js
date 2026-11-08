@@ -38,12 +38,17 @@ if (typeof window !== 'undefined' && typeof window.__ModuleLoader__ !== 'undefin
       const API_BALANCE = '/__dsh-balance-and-cost/balance'
       const API_USAGE = '/__dsh-balance-and-cost/usage'
       const REFRESH_MS = 15000
+      // /usage 下发的 CSRF token：重置必须带上它（跨站页面读不到响应，因此拿不到这个值）
+      let csrfToken = null
 
       const getBalance = () => fetch(API_BALANCE, { cache: 'no-store' }).then((r) => r.json())
       const getUsage = (sessionId) => fetch(
         API_USAGE + (sessionId ? '?sessionId=' + encodeURIComponent(sessionId) : ''),
         { cache: 'no-store' },
-      ).then((r) => r.json())
+      ).then((r) => r.json()).then((data) => {
+        if (data && typeof data.csrfToken === 'string') csrfToken = data.csrfToken
+        return data
+      })
 
       return {
         // 声明式注入：0.1.5 起客户端 ctx 只暴露已声明的服务
@@ -97,11 +102,37 @@ if (typeof window !== 'undefined' && typeof window.__ModuleLoader__ !== 'undefin
           else if (typeof ctx.on === 'function') ctx.on('dispose', disposeStyles)
 
           const fmtNum = (n) => (typeof n === 'number' && Number.isFinite(n) ? n.toLocaleString('zh-CN', { maximumFractionDigits: 2 }) : '—')
-          const fmtCost = (n) => (typeof n === 'number' ? '¥ ' + n.toFixed(4) : '—')
-          const fmtCostShort = (n) => (typeof n === 'number' ? '¥ ' + n.toFixed(3) : '—')
+          const fmtCost = (n) => (typeof n === 'number' && Number.isFinite(n) ? '¥ ' + n.toFixed(4) : '—')
+          const fmtCostShort = (n) => (typeof n === 'number' && Number.isFinite(n) ? '¥ ' + n.toFixed(3) : '—')
           const fmtBal = (n) => (typeof n === 'number' && Number.isFinite(n) ? n.toFixed(2) : '—')
           const fmtTime = (t) => (typeof t === 'number' ? new Date(t).toLocaleTimeString('zh-CN') : '—')
-          const tokOf = (u) => (u ? (u.inputTokens || 0) + (u.outputTokens || 0) : 0)
+          // 全部 token（含缓存读写）：本会话总量用这个口径，避免只算 input+output 严重低估
+          const tokAll = (u) => (u
+            ? (u.inputTokens || 0) + (u.outputTokens || 0) + (u.cacheReadTokens || 0) + (u.cacheWriteTokens || 0)
+            : 0)
+          // 余额钱包：新 Host 返回 wallets 数组；旧 Host 只有单币种字段
+          const walletsOf = (balance) => {
+            if (!balance || balance.ok !== true) return []
+            if (Array.isArray(balance.wallets) && balance.wallets.length) return balance.wallets
+            if (typeof balance.totalBalance === 'number') {
+              return [{ currency: balance.currency || '', total: balance.totalBalance, granted: balance.grantedBalance || 0, toppedUp: balance.toppedUpBalance || 0 }]
+            }
+            return []
+          }
+          const primaryWallet = (wallets) => wallets.find((w) => w.currency === 'CNY') || wallets[0] || null
+          // 余额基线：新格式按币种记，旧格式只有一个币种
+          const baselineWallets = (baseline) => {
+            if (!baseline) return {}
+            if (baseline.wallets && typeof baseline.wallets === 'object') return baseline.wallets
+            if (baseline.currency && typeof baseline.totalBalance === 'number') return { [baseline.currency]: baseline.totalBalance }
+            return {}
+          }
+          // CSV 单元格：防公式注入（= + - @ 开头的标题会被 Excel 当公式执行）
+          const csvCell = (value) => {
+            let text = value === null || value === undefined ? '' : String(value)
+            if (/^[=+\-@\t\r]/.test(text)) text = "'" + text
+            return '"' + text.replace(/"/g, '""') + '"'
+          }
           const modelsOf = (u) => (u && Array.isArray(u.models) && u.models.length ? u.models : null)
           // 数字缩略：≥1M → 4.5M；≥1K → 477K；其余取整
           const fmtCompact = (n) => {
@@ -175,18 +206,28 @@ if (typeof window !== 'undefined' && typeof window.__ModuleLoader__ !== 'undefin
 
             const balanceCard = []
             balanceCard.push(React.createElement('div', { className: 'dsbal-title', key: 't' }, 'DeepSeek 账户余额'))
+            const wallets = walletsOf(balance)
+            const primary = primaryWallet(wallets)
             if (!balance) {
               balanceCard.push(React.createElement('div', { className: 'dsbal-note', key: 'l' }, '加载中…'))
             } else if (!balance.ok) {
               balanceCard.push(React.createElement('div', { className: 'dsbal-bad', key: 'l' }, '余额查询失败：' + String(balance.error || '未知错误')))
-              balanceCard.push(React.createElement('div', { className: 'dsbal-note', key: 'n' }, '请确认 ~/.dsh/.credentials.yaml 中已配置 DEEPSEEK_API_KEY，且本机可访问 api.deepseek.com。'))
+              balanceCard.push(React.createElement('div', { className: 'dsbal-note', key: 'n' }, '可在「设置 → 模型」登录 DeepSeek 账号，或在 ~/.dsh/.credentials.yaml / 环境变量中配置 DEEPSEEK_API_KEY。'))
             } else {
-              balanceCard.push(React.createElement('div', { className: 'dsbal-big', key: 'b' }, fmtBal(balance.totalBalance) + ' ' + balance.currency))
+              balanceCard.push(React.createElement('div', { className: 'dsbal-big', key: 'b' }, fmtBal(primary.total) + ' ' + primary.currency))
               balanceCard.push(React.createElement('div', { className: 'dsbal-sub', key: 's' },
-                React.createElement('span', { className: balance.isAvailable ? 'dsbal-ok' : 'dsbal-bad' }, balance.isAvailable ? '● 账户可用' : '● 账户不可用')))
-              balanceCard.push(React.createElement('div', { className: 'dsbal-grid', key: 'g' },
-                React.createElement('div', { key: 'top' }, React.createElement('span', null, '充值余额'), fmtBal(balance.toppedUpBalance) + ' ' + balance.currency),
-                React.createElement('div', { key: 'grant' }, React.createElement('span', null, '赠送余额'), fmtBal(balance.grantedBalance) + ' ' + balance.currency)))
+                React.createElement('span', { className: balance.isAvailable ? 'dsbal-ok' : 'dsbal-bad' }, balance.isAvailable ? '● 账户可用' : '● 账户不可用'),
+                React.createElement('span', { className: 'dsbal-note' }, '（来源：' + (balance.source === 'account' ? '账号登录' : 'API Key') + '）')))
+              const walletRows = [
+                React.createElement('div', { key: 'top' }, React.createElement('span', null, '充值余额'), fmtBal(primary.toppedUp) + ' ' + primary.currency),
+                React.createElement('div', { key: 'grant' }, React.createElement('span', null, '赠送余额'), fmtBal(primary.granted) + ' ' + primary.currency),
+              ]
+              for (const wallet of wallets) {
+                if (wallet === primary) continue
+                walletRows.push(React.createElement('div', { key: 'w-' + wallet.currency },
+                  React.createElement('span', null, wallet.currency + ' 余额'), fmtBal(wallet.total) + ' ' + wallet.currency))
+              }
+              balanceCard.push(React.createElement('div', { className: 'dsbal-grid', key: 'g' }, walletRows))
             }
 
             const usageCard = []
@@ -195,8 +236,9 @@ if (typeof window !== 'undefined' && typeof window.__ModuleLoader__ !== 'undefin
               usageCard.push(React.createElement('div', { className: 'dsbal-note', key: 'l' }, '加载中…'))
             } else {
               const tot = usage.totals || {}
-              const delta = balance && balance.ok && usage.baseline
-                ? (usage.baseline.totalBalance - balance.totalBalance)
+              const baseWallets = baselineWallets(usage.baseline)
+              const delta = primary && Object.prototype.hasOwnProperty.call(baseWallets, primary.currency)
+                ? baseWallets[primary.currency] - primary.total
                 : null
               usageCard.push(React.createElement('div', { className: 'dsbal-grid', key: 'g' },
                 React.createElement('div', { key: 'calls' }, React.createElement('span', null, '模型调用'), fmtNum(tot.calls) + ' 次'),
@@ -215,23 +257,29 @@ if (typeof window !== 'undefined' && typeof window.__ModuleLoader__ !== 'undefin
                 '；历史花费按消耗发生时刻的时段计价并已冻结，不随当前时段变化'))
               usageCard.push(React.createElement('div', { className: 'dsbal-sub', key: 'd' },
                 delta === null
-                  ? '余额变化对比：等待余额基线建立…'
-                  : React.createElement('span', { className: delta >= 0 ? 'dsbal-ok' : 'dsbal-bad' }, '余额变化：' + delta.toFixed(2) + ' ' + balance.currency + '（自统计起）')))
-              usageCard.push(React.createElement('div', { className: 'dsbal-note', key: 's' }, '统计持久化于 ' + fmtTime(usage.startedAt) + ' 起；余额基线 = 首次成功查询时的余额。当前会话的实时消耗见主页输入框下方的摘要条。'))
+                  ? (balance && balance.ok ? '余额变化对比：等待余额基线建立…' : '余额变化对比：余额不可用')
+                  : React.createElement('span', { className: delta >= 0 ? 'dsbal-ok' : 'dsbal-bad' },
+                    '余额变化（含充值，仅供参考）：' + delta.toFixed(2) + ' ' + primary.currency + '（自统计起）')))
+              usageCard.push(React.createElement('div', { className: 'dsbal-note', key: 's' }, '统计持久化于 ' + fmtTime(usage.startedAt) + ' 起；余额基线 = 首次成功查询时的余额（按币种分别记录）。当前会话的实时消耗见主页输入框下方的摘要条。'))
               if (usage.pricing) {
                 const pr = usage.pricing
                 const table = pr.table
                 usageCard.push(React.createElement('div', { className: 'dsbal-title', key: 'kt' }, '计价缓存（按小时）'))
                 usageCard.push(React.createElement('div', { className: 'dsbal-note', key: 'kn' },
                   '每次消耗都记录发生时间（北京整点）与当时单价，费用按记录冻结；共 ' + fmtNum(pr.hours) + ' 个整点，'
-                  + '高峰 ' + fmtCompact(pr.peakTokens) + ' tok / 空闲 ' + fmtCompact(pr.offTokens) + ' tok，缓存合计 ≈' + fmtCost(pr.costCny)
-                  + '（与上方估算费用一致）。'))
+                  + '高峰 ' + fmtCompact(pr.peakTokens) + ' tok / 空闲 ' + fmtCompact(pr.offTokens) + ' tok，计价缓存合计 ≈' + fmtCost(pr.costCny) + '。'
+                  + (Math.abs((pr.costCny || 0) - (tot.costCny || 0)) > 1e-9
+                    ? '另有 ' + fmtCost(Math.max(0, (tot.costCny || 0) - (pr.costCny || 0))) + ' 来自无时间记录的历史消耗（三档按权重估算分摊，合计仍为真实费用）。'
+                    : '与上方估算费用一致。')))
                 if (table) {
                   usageCard.push(React.createElement('div', { className: 'dsbal-note', key: 'tb' },
-                    '价格表 v' + table.version + '（' + String(table.effectiveAt).slice(0, 10) + ' 生效，' + table.peakRule + '）：'
+                    '价格表 v' + table.version + '（' + String(table.effectiveAt).slice(0, 10) + ' 生效；' + table.peakRule + '；法定节假日 ' + fmtNum(table.holidays || 0) + ' 天）：'
                     + (table.models || []).map((m) => m.model + ' 未命中 ¥' + m.inputMiss.off + '/' + m.inputMiss.peak
                       + ' · 命中 ¥' + m.inputHit.off + '/' + m.inputHit.peak
-                      + ' · 输出 ¥' + m.output.off + '/' + m.output.peak + '（空闲/高峰，元每百万 tok）').join('；')))
+                      + ' · 输出 ¥' + m.output.off + '/' + m.output.peak + '（空闲/高峰，元每百万 tok）').join('；')
+                    + (table.config && table.config.path
+                      ? '（来源：' + (table.config.applied ? '配置文件 ' + table.config.path : '内置价格表；可创建 ' + table.config.path + ' 覆盖') + '）'
+                      : '')))
                 }
                 const hourRows = []
                 for (const h of (pr.settled || [])) {
@@ -310,7 +358,7 @@ if (typeof window !== 'undefined' && typeof window.__ModuleLoader__ !== 'undefin
                 const miss = missOf(s)
                 rows.push(['会话', s.title || String(s.sessionId), s.calls, miss, s.cacheReadTokens, s.outputTokens, miss + s.cacheReadTokens + s.outputTokens, (s.costCny || 0).toFixed(6)])
               }
-              const csv = '\uFEFF' + rows.map((r) => r.map((v) => '"' + String(v).replace(/"/g, '""') + '"').join(',')).join('\r\n')
+              const csv = '\uFEFF' + rows.map((r) => r.map((v) => csvCell(v)).join(',')).join('\r\n')
               const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' })
               const url = URL.createObjectURL(blob)
               const a = document.createElement('a')
@@ -319,14 +367,23 @@ if (typeof window !== 'undefined' && typeof window.__ModuleLoader__ !== 'undefin
               a.click()
               URL.revokeObjectURL(url)
             }
-            // 重置记录（Host 清空统计并持久化）
+            // 重置记录（Host 清空统计并持久化；破坏性操作需要 CSRF token）
             const resetStats = async () => {
               if (typeof window !== 'undefined' && typeof window.confirm === 'function'
                 && !window.confirm('确定要清空全部用量统计与余额基线吗？此操作不可撤销。')) {
                 return
               }
+              const post = () => fetch('/__dsh-balance-and-cost/reset', {
+                method: 'POST',
+                headers: csrfToken ? { 'x-dsh-balance-token': csrfToken } : {},
+              })
               try {
-                const res = await fetch('/__dsh-balance-and-cost/reset', { method: 'POST' })
+                let res = await post()
+                if (res.status === 403) {
+                  // token 还没拿到（例如面板刚打开）：先取一次 /usage 再重试
+                  await getUsage(null)
+                  res = await post()
+                }
                 const body = await res.json()
                 if (!body || body.ok !== true) throw new Error((body && body.error) || 'reset failed')
                 load()
@@ -344,7 +401,7 @@ if (typeof window !== 'undefined' && typeof window.__ModuleLoader__ !== 'undefin
                 React.createElement('button', { className: 'dsbal-btn', onClick: exportCsv }, '导出明细'),
                 React.createElement('button', { className: 'dsbal-btn', onClick: resetStats }, '重置记录'),
                 error ? React.createElement('span', { className: 'dsbal-bad' }, '刷新出错：' + error) : null),
-              React.createElement('div', { className: 'dsbal-note' }, '每 15 秒自动刷新（余额查询 Host 端缓存 60 秒）。费用按官方最新价格表分高峰/空闲计价（高峰 = 工作日北京时间 9-12 / 14-18），并以「消耗发生时刻」的单价写入计价缓存后冻结——高峰/空闲切换只会影响之后的新消耗，不会改变历史花费。'))
+              React.createElement('div', { className: 'dsbal-note' }, '每 15 秒自动刷新（余额查询 Host 端缓存 60 秒）。费用按官方价格表分高峰/空闲计价（高峰 = 工作日北京时间 9-12 / 14-18，法定节假日全天空闲），并以「消耗发生时刻」的单价写入计价缓存后冻结——高峰/空闲切换只会影响之后的新消耗，不会改变历史花费。价格表可用 $DSH_HOME/dsh-balance-and-cost.pricing.json 覆盖。'))
           }
 
           function Summary(props) {
@@ -383,8 +440,10 @@ if (typeof window !== 'undefined' && typeof window.__ModuleLoader__ !== 'undefin
               }
             }, [sessionId])
 
-            const balText = balance && balance.ok
-              ? fmtBal(balance.totalBalance) + ' ' + balance.currency
+            const balWallets = walletsOf(balance)
+            const balPrimary = primaryWallet(balWallets)
+            const balText = balance && balance.ok && balPrimary
+              ? fmtBal(balPrimary.total) + ' ' + balPrimary.currency + (balWallets.length > 1 ? '（等 ' + balWallets.length + ' 个币种）' : '')
               : (balance && !balance.ok ? '余额—' : '余额…')
 
             let curNodes = React.createElement('span', null, '本会话 —')
@@ -400,6 +459,10 @@ if (typeof window !== 'undefined' && typeof window.__ModuleLoader__ !== 'undefin
               }
               const selBd = usage.current && usage.current.selectedBreakdown
               const totBd = usage.totals && usage.totals.breakdown
+              const currentHasUsage = !!usage.current && usage.current.calls > 0
+              // 选中的模型在本会话没被调用过（例如刚切模型、或会话用的是另一个模型）时，
+              // 不要显示「本会话 0 tok ≈¥0.000」——退回会话合计。
+              const selHasUsage = !!selBd && selBd.totalTokens > 0
               // token 数字（M/K 缩略），悬停显示三档明细（官方口径）
               const tokEl = (bd) => {
                 const el = React.createElement('span', { className: 'dsbal-models' }, fmtCompact(bd.totalTokens) + ' tok')
@@ -408,22 +471,26 @@ if (typeof window !== 'undefined' && typeof window.__ModuleLoader__ !== 'undefin
               if (totBd) {
                 totNodes = React.createElement('span', null, '总计 ', React.createElement('span', null, fmtCompact(totBd.totalTokens) + ' tok'), ' ≈' + fmtCostShort(totBd.totalCostCny))
               } else {
-                totNodes = React.createElement('span', null, '总计 ' + fmtNum(tokOf(usage.totals)) + ' tok ≈' + fmtCostShort(usage.totals.costCny))
+                totNodes = React.createElement('span', null, '总计 ' + fmtNum(tokAll(usage.totals)) + ' tok ≈' + fmtCostShort(usage.totals.costCny))
               }
               if (curLabel) {
-                let labelEl = React.createElement('span', { className: 'dsbal-models' }, curLabel)
-                // 模型名上悬停：两模型实际消耗量与估算价对比（与默认 stats 行同款 Tooltip）
-                const detail = (usage.current.modelsActual || [])
-                  .map((m) => m.model + (m.selected ? '（上次调用）' : '') + '：' + fmtNum(m.tokens) + ' tok ≈' + fmtCostShort(m.costCny))
-                  .join(' · ')
-                labelEl = withDetail(labelEl, detail)
-                if (selBd) {
+                const labelEl = withDetail(
+                  React.createElement('span', { className: 'dsbal-models' }, curLabel),
+                  // 模型名上悬停：两模型实际消耗量与估算价对比（与默认 stats 行同款）
+                  (usage.current.modelsActual || [])
+                    .map((m) => m.model + (m.selected ? '（当前选中）' : '') + '：' + fmtNum(m.tokens) + ' tok ≈' + fmtCostShort(m.costCny))
+                    .join(' · '),
+                )
+                if (selHasUsage) {
                   curNodes = React.createElement('span', null, '本会话 (', labelEl, ') ', tokEl(selBd), ' ≈' + fmtCostShort(selBd.totalCostCny))
+                } else if (currentHasUsage) {
+                  // 会话有消耗、但不是这个模型：显示会话合计（不带模型名，避免误导）
+                  curNodes = React.createElement('span', null, '本会话 ', fmtCompact(tokAll(usage.current)) + ' tok ≈' + fmtCostShort(usage.current.costCny))
                 } else {
-                  curNodes = React.createElement('span', null, '本会话 (', labelEl, ') ' + fmtNum(tokOf(usage.current)) + ' tok ≈' + fmtCostShort(usage.current.costCny))
+                  curNodes = React.createElement('span', null, '本会话 (', labelEl, ') 0 tok')
                 }
-              } else {
-                curNodes = React.createElement('span', null, '本会话 ', selBd ? tokEl(selBd) : fmtNum(tokOf(usage.current)) + ' tok', selBd ? ' ≈' + fmtCostShort(selBd.totalCostCny) : ' ≈' + fmtCostShort(usage.current.costCny))
+              } else if (currentHasUsage) {
+                curNodes = React.createElement('span', null, '本会话 ', fmtCompact(tokAll(usage.current)) + ' tok ≈' + fmtCostShort(usage.current.costCny))
               }
             }
 

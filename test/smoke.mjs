@@ -8,6 +8,7 @@ import {
   isPeak, priceFor, usageBreakdown, scopeBreakdown, tokensFromRow,
   beijingHourKey, beijingHourStart, emptyLedger, ledgerAdd, ledgerTotals, ledgerView,
   normalizeModel, prefixMatch, modelMatches, reviveLedger, repriceLedger, mergeStats, planLegacyMerge, isDuplicateShard,
+  normalizePerModel, configurePricing, isMeteredProvider,
   PRICING_VERSION, PRICING_INFO, LEGACY_DATA_FILES, DSH_HOME_DIR,
 } from '../src/index.js'
 
@@ -23,7 +24,7 @@ assert.equal(pkg.exports['./client'], './src/client.js', 'exports["./client"] �
 // ── node half：导出形状 ──────────────────────────────────────────────────────
 const host = await import('../src/index.js')
 assert.equal(host.name, 'dsh-balance-and-cost')
-assert.deepEqual(host.inject, ['webServer'], '应声明 webServer 硬依赖')
+assert.deepEqual(host.inject, [], 'webServer 不应是硬依赖（headless 组合也要统计）')
 assert.equal(typeof host.apply, 'function')
 
 // ── 分时段判定（北京时间）：高峰 = 工作日 9-12 / 14-18（周末全天空闲）────────
@@ -230,7 +231,7 @@ assert.equal(shardA.startedAt, 1000, '起点取更早的一个')
 assert.equal(shardA.totals.perModel['p:m'].calls, 7, '按模型明细相加')
 assert.equal(shardA.sessions.s.calls, 7, '会话明细相加')
 assert.equal(shardA.sessions.s.modelsTok.m.costCny, 4.0, '会话分模型费用相加')
-// 互补分片（会话 id 不同或缺次数不同）→ 合并；完全一致的副本 → 忽略
+// 互补分片（会话 id 不同）→ 合并；有任何一个会话重叠 → 整体跳过（避免重复计数）
 const primaryLike = { path: 'new.json', sessions: { s1: { calls: 5 } } }
 assert.deepEqual(
   planLegacyMerge(primaryLike, [
@@ -238,15 +239,66 @@ assert.deepEqual(
     { path: 'other.json', sessions: { s1: { calls: 5 }, s2: { calls: 9 } } },
     { path: 'same-count.json', sessions: { s1: { calls: 5 } } },
     { path: 'different-count.json', sessions: { s1: { calls: 6 } } },
+    { path: 'fresh.json', sessions: { s2: { calls: 9 } } },
   ]).map((item) => item.path),
-  ['other.json', 'different-count.json'],
-  '只合并互补分片，跳过重复副本与主文件自身',
+  ['fresh.json'],
+  '只有与会话完全不重叠的旧分片才合并，部分重叠的旧文件整体跳过',
 )
 assert.equal(isDuplicateShard({ a: { calls: 1 } }, { a: { calls: 1 } }), true)
 assert.equal(isDuplicateShard({ a: { calls: 1 } }, { a: { calls: 2 } }), false, '同一会话次数不同 = 两个进程各自的调用')
 assert.equal(isDuplicateShard({}, {}), false, '空会话集不判为副本')
 
+// ── 法定节假日（2026 国办发明电〔2025〕7 号）：工作日假期按空闲计价 ─────────────
+assert.equal(isPeak(new Date('2026-10-01T02:00:00Z')), false, '国庆（周四）北京 10:00 应为空闲')
+assert.equal(isPeak(new Date('2026-10-05T02:00:00Z')), false, '国庆（周一）北京 10:00 应为空闲')
+assert.equal(isPeak(new Date('2026-09-25T02:00:00Z')), false, '中秋（周五）北京 10:00 应为空闲')
+assert.equal(isPeak(new Date('2026-02-17T02:00:00Z')), false, '春节（周二）北京 10:00 应为空闲')
+assert.equal(isPeak(new Date('2026-10-08T02:00:00Z')), true, '节后工作日北京 10:00 恢复高峰')
+
+// ── 模型归一化不再吞掉未知变体（deepseek-flash-lite 不能按 flash 计价）──────────
+assert.equal(normalizeModel('deepseek-flash-lite'), 'deepseek-flash-lite', '未知变体保留原名')
+assert.equal(priceFor('deepseek-flash-lite', new Date('2026-09-14T02:00:00Z')).estimated, true, '未知变体标记估算')
+assert.equal(modelMatches('deepseek-flash-lite', 'deepseek-flash'), false, '未知变体不得并入 flash')
+assert.equal(modelMatches('deepseek-flash-1017', 'deepseek-flash'), true, '日期版本后缀仍归一到 flash')
+
+// ── perModel 归一化：旧名与新名合并成一行，estimated 按当前价目表刷新 ───────────
+const mergedPerModel = normalizePerModel({
+  'deepseek-official:deepseek-v4-flash': { provider: 'deepseek-official', model: 'deepseek-v4-flash', calls: 3, inputTokens: 30, outputTokens: 3, cacheReadTokens: 0, cacheWriteTokens: 0, costCny: 1, estimated: true },
+  'deepseek-official:deepseek-flash': { provider: 'deepseek-official', model: 'deepseek-flash', calls: 2, inputTokens: 20, outputTokens: 2, cacheReadTokens: 0, cacheWriteTokens: 0, costCny: 2, estimated: true },
+})
+assert.deepEqual(Object.keys(mergedPerModel), ['deepseek-official:deepseek-flash'], '同族只保留一行')
+assert.equal(mergedPerModel['deepseek-official:deepseek-flash'].calls, 5, '调用次数合并')
+assert.equal(mergedPerModel['deepseek-official:deepseek-flash'].costCny, 3, '费用合并')
+assert.equal(mergedPerModel['deepseek-official:deepseek-flash'].estimated, false, '已知模型不再标记估算')
+
+// ── 旧分片只消费一次：已消费/已被主文件包含的旧文件不得再次合并 ─────────────────
+const mergedNow = { s: { calls: 10 } }
+assert.deepEqual(planLegacyMerge({ path: 'main', sessions: mergedNow }, [{ path: 'old', sessions: { s: { calls: 3 } } }], {}), [], '会话重叠 → 跳过')
+assert.deepEqual(planLegacyMerge({ path: 'main', sessions: mergedNow }, [{ path: 'old', sessions: { s: { calls: 3 } } }], { old: { at: 1 } }), [], '已消费过 → 跳过')
+assert.equal(planLegacyMerge({ path: 'main', sessions: mergedNow }, [{ path: 'new', sessions: { other: { calls: 2 } } }], {}).length, 1, '完全不重叠的分片仍然合并')
+
+// ── 归档分桶保留时段口径（否则 30 天后高峰 token 会全部算成空闲）────────────────
+const settledLedger = emptyLedger()
+settledLedger.settled.m = { calls: 2, missTokens: 100, hitTokens: 0, outputTokens: 0, missCostCny: 0.1, hitCostCny: 0, outputCostCny: 0, hours: 1, peakTokens: 100, offTokens: 0, firstAt: 1, lastAt: 1 }
+const settledTotals = ledgerTotals(settledLedger, null)
+assert.equal(settledTotals.peakTokens, 100, '归档高峰 token 保留')
+assert.equal(settledTotals.offTokens, 0)
+settledLedger.settled.legacy = { calls: 1, missTokens: 50, hitTokens: 0, outputTokens: 0, missCostCny: 0.05, hitCostCny: 0, outputCostCny: 0, hours: 1 }
+assert.equal(ledgerTotals(settledLedger, null).offTokens, 50, '旧归档没有时段信息时按空闲计（兼容）')
+
+// ── 定价覆盖：自定义模型 / 节假日 / 供应商（放在最后，避免影响前面的断言）────────
+const override = configurePricing({
+  models: { 'my-model': { inputMiss: { peak: 10, off: 5 }, inputHit: { peak: 1, off: 0.5 }, output: { peak: 20, off: 10 } } },
+  holidays: ['2026-12-25'],
+  providers: ['deepseek-official', 'my-provider'],
+})
+assert.equal(override.applied, true)
+assert.equal(priceFor('my-model', new Date('2026-09-14T02:00:00Z')).input, 10, '自定义模型生效')
+assert.equal(isPeak(new Date('2026-12-25T02:00:00Z')), false, '自定义节假日生效')
+assert.equal(isMeteredProvider('my-provider'), true, '自定义 provider 生效')
+assert.equal(isMeteredProvider('my-deepseek-proxy'), false, '第三方 deepseek 网关不被统计')
+
 // ── browser half：Node 环境下加载不应有副作用、不应抛错 ─────────────────────
 await import('../src/client.js')
 
-console.log('smoke OK: manifest / node half / browser half / 分时段计价 / 计价缓存（时段切换不跳变）')
+console.log('smoke OK: manifest / node half / browser half / 分时段与节假日计价 / 模型归一化 / 分片只消费一次 / 定价覆盖')
